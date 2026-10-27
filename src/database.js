@@ -49,11 +49,11 @@ function rowToObj(cols, vals) {
   return obj;
 }
 
-async function registerUser({ tgId, username, firstName, email, uuid, subId }) {
+async function registerUser({ tgId, username, firstName, email, uuid, subId, trafficLimit }) {
   const d = await getDb();
   d.run(
-    'INSERT INTO users (tg_id, tg_username, tg_first_name, email, uuid, sub_id, registered_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [tgId, username || '', firstName || '', email, uuid, subId, Date.now()]
+    'INSERT INTO users (tg_id, tg_username, tg_first_name, email, uuid, sub_id, registered_at, traffic_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [tgId, username || '', firstName || '', email, uuid, subId, Date.now(), trafficLimit || 107374182400]
   );
   saveDb();
 }

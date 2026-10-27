@@ -114,15 +114,32 @@ EOJSON
 cat > src/config.js <<'EOF'
 const fs = require('fs');
 const path = require('path');
+
 const CONFIG_PATH = path.join(__dirname, '..', 'data', 'config.json');
+
 let config = null;
+
 function loadConfig() {
   if (config) return config;
-  if (!fs.existsSync(CONFIG_PATH)) throw new Error('Config not found. Run installer.');
+  if (!fs.existsSync(CONFIG_PATH)) {
+    throw new Error('Config file not found. Run installer first.');
+  }
   config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   return config;
 }
-module.exports = { getConfig: loadConfig };
+
+function saveConfig(cfg) {
+  config = cfg;
+  const dir = path.dirname(CONFIG_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+}
+
+function getConfig() {
+  return loadConfig();
+}
+
+module.exports = { getConfig, saveConfig };
 EOF
 
 # src/database.js
@@ -130,124 +147,366 @@ cat > src/database.js <<'EOF'
 const initSqlJs = require('sql.js');
 const fs = require('fs');
 const path = require('path');
+
 const DB_PATH = path.join(__dirname, '..', 'data', 'bot.db');
 let db = null;
+
 async function getDb() {
   if (db) return db;
   const SQL = await initSqlJs();
   if (fs.existsSync(DB_PATH)) {
-    db = new SQL.Database(fs.readFileSync(DB_PATH));
+    const fileData = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(fileData);
   } else {
     db = new SQL.Database();
   }
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    tg_id INTEGER PRIMARY KEY, tg_username TEXT, tg_first_name TEXT,
-    email TEXT UNIQUE NOT NULL, uuid TEXT NOT NULL, sub_id TEXT NOT NULL,
-    registered_at INTEGER NOT NULL, is_active INTEGER DEFAULT 0,
-    traffic_limit INTEGER DEFAULT 107374182400, used_traffic INTEGER DEFAULT 0
-  )`);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      tg_id INTEGER PRIMARY KEY,
+      tg_username TEXT,
+      tg_first_name TEXT,
+      email TEXT UNIQUE NOT NULL,
+      uuid TEXT NOT NULL,
+      sub_id TEXT NOT NULL,
+      registered_at INTEGER NOT NULL,
+      is_active INTEGER DEFAULT 0,
+      traffic_limit INTEGER DEFAULT 107374182400,
+      used_traffic INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS admin_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+  `);
   return db;
 }
+
 function saveDb() {
   if (!db) return;
   const dir = path.dirname(DB_PATH);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(DB_PATH, Buffer.from(db.export()));
+  const data = db.export();
+  fs.writeFileSync(DB_PATH, Buffer.from(data));
 }
-function rowToObj(cols, vals) { const o={}; cols.forEach((c,i)=>o[c]=vals[i]); return o; }
-async function registerUser({tgId,username,firstName,email,uuid,subId}) {
+
+function rowToObj(cols, vals) {
+  const obj = {};
+  cols.forEach((c, i) => obj[c] = vals[i]);
+  return obj;
+}
+
+async function registerUser({ tgId, username, firstName, email, uuid, subId, trafficLimit }) {
   const d = await getDb();
-  d.run('INSERT INTO users (tg_id,tg_username,tg_first_name,email,uuid,sub_id,registered_at) VALUES (?,?,?,?,?,?,?)',
-    [tgId, username||'', firstName||'', email, uuid, subId, Date.now()]);
+  d.run(
+    'INSERT INTO users (tg_id, tg_username, tg_first_name, email, uuid, sub_id, registered_at, traffic_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [tgId, username || '', firstName || '', email, uuid, subId, Date.now(), trafficLimit || 107374182400]
+  );
   saveDb();
 }
+
 async function getUserByTgId(tgId) {
   const d = await getDb();
-  const r = d.exec('SELECT * FROM users WHERE tg_id=' + Number(tgId));
-  return (r.length && r[0].values.length) ? rowToObj(r[0].columns, r[0].values[0]) : null;
+  const res = d.exec('SELECT * FROM users WHERE tg_id = ' + Number(tgId));
+  if (!res.length || !res[0].values.length) return null;
+  return rowToObj(res[0].columns, res[0].values[0]);
 }
+
 async function getAllUsers() {
   const d = await getDb();
-  const r = d.exec('SELECT * FROM users');
-  if (!r.length) return [];
-  return r[0].values.map(v => rowToObj(r[0].columns, v));
+  const res = d.exec('SELECT * FROM users');
+  if (!res.length) return [];
+  const cols = res[0].columns;
+  return res[0].values.map(vals => rowToObj(cols, vals));
 }
-async function setActive(tgId, active) {
+
+async function setActive(tgId, isActive) {
   const d = await getDb();
-  d.run('UPDATE users SET is_active=' + (active?1:0) + ' WHERE tg_id=' + Number(tgId));
+  d.run('UPDATE users SET is_active = ' + (isActive ? 1 : 0) + ' WHERE tg_id = ' + Number(tgId));
   saveDb();
 }
+
 async function deleteUser(tgId) {
   const d = await getDb();
-  d.run('DELETE FROM users WHERE tg_id=' + Number(tgId));
+  d.run('DELETE FROM users WHERE tg_id = ' + Number(tgId));
   saveDb();
 }
-module.exports = { getDb, saveDb, registerUser, getUserByTgId, getAllUsers, setActive, deleteUser };
+
+module.exports = {
+  getDb,
+  saveDb,
+  registerUser,
+  getUserByTgId,
+  getAllUsers,
+  setActive,
+  deleteUser,
+};
 EOF
 
 # src/api3xui.js
 cat > src/api3xui.js <<'EOF'
 const { request } = require('undici');
 const { getConfig } = require('./config');
+
+const GiB = 1024 * 1024 * 1024;
+
 let cookies = '';
+// 'clients' — 3x-ui >= 3.0: клиент это отдельная сущность, одна общая квота на все инбаунды
+// 'legacy'  — 3x-ui 2.x: клиент заводится отдельно в каждом инбаунде
+let apiMode = null;
+
 async function login() {
   const cfg = getConfig();
-  const baseUrl = cfg.panel_url.replace(/\/$/,'');
-  if (cfg.api_token) return;
-  const lp = cfg.panel_base_path ? cfg.panel_base_path+'/login' : '/login';
-  const res = await request(baseUrl+lp, {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:'username='+encodeURIComponent(cfg.panel_username)+'&password='+encodeURIComponent(cfg.panel_password)});
-  const sc = res.headers['set-cookie'];
-  if (sc) cookies = sc.map(c=>c.split(';')[0]).join('; ');
-  const json = await res.body.json();
-  if (!json.success) throw new Error('Panel login failed');
-}
-async function req(path, method='GET', body=null) {
-  const cfg = getConfig();
-  const baseUrl = cfg.panel_url.replace(/\/$/,'');
-  const h = {};
-  if (cfg.api_token) h['Authorization']='Bearer '+cfg.api_token;
-  else if (cookies) h['Cookie']=cookies;
-  const opts = {method,headers:h};
-  if (body) { h['Content-Type']='application/json'; opts.body=JSON.stringify(body); }
-  const res = await request(baseUrl+path, opts);
-  return res.body.json();
-}
-async function getInbounds() { return (await req('/panel/api/inbounds/list')).obj||[]; }
-async function getNewUUID() { return (await req('/panel/api/server/getNewUUID')).obj; }
-async function addClient(id,c) { return req('/panel/api/inbounds/'+id+'/addClient','POST',c); }
-async function updateClient(id,cid,c) { return req('/panel/api/inbounds/'+id+'/updateClient/'+cid,'POST',c); }
-async function deleteClient(id,cid) { return req('/panel/api/inbounds/'+id+'/delClient/'+cid,'POST'); }
-async function getClientTraffics(email) { return (await req('/panel/api/inbounds/getClientTraffics/'+encodeURIComponent(email))).obj; }
-async function getServerStatus() { return (await req('/panel/api/server/status')).obj; }
-async function getOnlineUsers() { return (await req('/panel/api/inbounds/onlines')).obj||[]; }
-async function registerUser({email,uuid,subId,tgId}) {
-  const cfg = getConfig();
-  const lim = cfg.default_traffic_gb * 1073741824;
-  const inbounds = await getInbounds();
-  for (const ib of inbounds) {
-    const st = JSON.parse(ib.settings||'{}');
-    const c = {id:uuid,uuid,email,flow:(st.clients&&st.clients[0])?(st.clients[0].flow||''):'',enable:false,subId,total:lim,expiryTime:0,tgId:String(tgId||''),reset:0};
-    if (ib.protocol==='trojan') { c.password=uuid; delete c.id; delete c.uuid; }
-    if (ib.protocol==='shadowsocks') { c.password=uuid; c.method=st.method||'aes-128-gcm'; delete c.id; delete c.uuid; }
-    await addClient(ib.id, c);
+  if (cfg.api_token) {
+    apiMode = await probeClientsApi();
+    return;
   }
+
+  const baseUrl = cfg.panel_url.replace(/\/$/, '');
+  const loginPath = cfg.panel_base_path ? `${cfg.panel_base_path}/login` : '/login';
+  const res = await request(`${baseUrl}${loginPath}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `username=${encodeURIComponent(cfg.panel_username)}&password=${encodeURIComponent(cfg.panel_password)}`,
+  });
+
+  const setCookie = res.headers['set-cookie'];
+  if (setCookie) cookies = setCookie.map(c => c.split(';')[0]).join('; ');
+
+  const json = await res.body.json().catch(() => ({}));
+  if (json.success === false) throw new Error('Panel login failed: ' + (json.msg || 'unknown'));
+  apiMode = await probeClientsApi();
 }
+
+// Панели 2.x отдают на неизвестный путь HTML или пустое тело,
+// поэтому режим определяется по наличию JSON-массива в obj.
+async function probeClientsApi() {
+  try {
+    const res = await apiRequest('/panel/api/clients/list');
+    if (res && Array.isArray(res.obj)) return 'clients';
+  } catch (e) {
+    /* неизвестный эндпоинт — старый API */
+  }
+  return 'legacy';
+}
+
+async function apiRequest(path, method = 'GET', body = null, allowRetry = true) {
+  const cfg = getConfig();
+  const baseUrl = cfg.panel_url.replace(/\/$/, '');
+  const headers = {};
+  if (cfg.api_token) headers['Authorization'] = `Bearer ${cfg.api_token}`;
+  else if (cookies) headers['Cookie'] = cookies;
+
+  const opts = { method, headers };
+  if (body !== null && body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+
+  const res = await request(`${baseUrl}${path}`, opts);
+  const text = await res.body.text();
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    // Пустой ответ addClient — известная особенность ряда версий панели.
+    return { success: res.statusCode >= 200 && res.statusCode < 300, obj: null, raw: text };
+  }
+
+  const sessionExpired = res.statusCode === 401 ||
+    (json && json.msg && /login|session/i.test(String(json.msg)));
+  if (sessionExpired && allowRetry && !cfg.api_token) {
+    await login();
+    return apiRequest(path, method, body, false);
+  }
+
+  if (res.statusCode === 404) throw new Error(`Not found: ${path}`);
+  return json;
+}
+
+// Поле totalGB в API панели хранит байты, а не гигабайты
+// (в исходниках Total = client.TotalGB пишется прямо в client_traffics.total).
+function trafficBytes() {
+  const gb = Number(getConfig().default_traffic_gb) || 100;
+  return Math.round(gb * GiB);
+}
+
+function getApiMode() {
+  return apiMode;
+}
+
+async function getInbounds() {
+  const res = await apiRequest('/panel/api/inbounds/list');
+  return res.obj || [];
+}
+
+async function getServerStatus() {
+  const res = await apiRequest('/panel/api/server/status');
+  return res.obj;
+}
+
+async function getOnlineCount() {
+  if (apiMode === 'clients') {
+    const res = await apiRequest('/panel/api/clients/onlines', 'POST', {});
+    return Array.isArray(res.obj) ? res.obj : [];
+  }
+  const res = await apiRequest('/panel/api/inbounds/onlines');
+  return Array.isArray(res.obj) ? res.obj : [];
+}
+
+/**
+ * Регистрация.
+ *
+ * В режиме 'clients' один POST /clients/add создаёт ОДНУ запись клиента
+ * и привязывает её ко всем инбаундам. Таблица client_traffics ключуется по email,
+ * поэтому total — единая квота на все инбаунды, а up/down суммируются с любого.
+ * Кредиты (uuid/password/...) панель генерирует сама под протокол каждого инбаунда.
+ */
+async function registerUser({ email, subId, tgId, inboundIds }) {
+  const total = trafficBytes();
+
+  if (apiMode === 'clients') {
+    const res = await apiRequest('/panel/api/clients/add', 'POST', {
+      client: {
+        email,
+        subId,
+        tgId: Number(tgId) || 0,
+        enable: false,
+        totalGB: total,
+        expiryTime: 0,
+        limitIp: 0,
+        reset: 0,
+      },
+      inboundIds,
+    });
+    if (res.success === false) throw new Error(res.msg || 'client create failed');
+    const rec = await getClient(email);
+    return { uuid: (rec && rec.client && rec.client.uuid) || null, total };
+  }
+
+  // 3x-ui 2.x: клиента нужно заводить в каждый инбаунд отдельно.
+  const uuid = await getNewUUID();
+  if (!uuid) throw new Error('панель не вернула UUID (getNewUUID) — проверьте версию API');
+
+  const inbounds = await getInbounds();
+  for (const inbound of inbounds) {
+    if (!inboundIds.includes(inbound.id)) continue;
+    const settings = JSON.parse(inbound.settings || '{}');
+    const client = {
+      id: uuid,
+      email,
+      flow: (settings.clients && settings.clients[0] && settings.clients[0].flow) || '',
+      enable: false,
+      subId,
+      totalGB: total,
+      expiryTime: 0,
+      tgId: Number(tgId) || 0,
+      reset: 0,
+    };
+    // Панель требует свой credential под каждый протокол
+    if (inbound.protocol === 'trojan' || inbound.protocol === 'shadowsocks') {
+      client.password = uuid.replace(/-/g, '');
+    }
+    const r = await apiRequest(`/panel/api/inbounds/${inbound.id}/addClient`, 'POST', client);
+    if (r.success === false) throw new Error(r.msg || `addClient failed on inbound ${inbound.id}`);
+  }
+  return { uuid, total };
+}
+
+async function getClient(email) {
+  const res = await apiRequest(`/panel/api/clients/get/${encodeURIComponent(email)}`);
+  return res.obj;
+}
+
+async function getNewUUID() {
+  const res = await apiRequest('/panel/api/server/getNewUUID');
+  return res.obj;
+}
+
+/** Включение/выключение одной командой — действует на все инбаунды клиента. */
 async function setClientActive(email, active) {
-  const cfg = getConfig();
-  const lim = cfg.default_traffic_gb * 1073741824;
+  if (apiMode === 'clients') {
+    const path = active ? '/panel/api/clients/bulkEnable' : '/panel/api/clients/bulkDisable';
+    const res = await apiRequest(path, 'POST', { emails: [email] });
+    if (res.success === false) throw new Error(res.msg || 'toggle failed');
+    return;
+  }
+
+  const total = trafficBytes();
   const inbounds = await getInbounds();
-  for (const ib of inbounds) {
-    const st = JSON.parse(ib.settings||'{}');
-    const c = (st.clients||[]).find(x=>x.email===email);
-    if (c) await updateClient(ib.id, c.id||c.password, {...c,enable:active,total:lim});
+  for (const inbound of inbounds) {
+    const settings = JSON.parse(inbound.settings || '{}');
+    const client = (settings.clients || []).find(c => c.email === email);
+    if (!client) continue;
+    const clientId = client.id || client.password || client.subId;
+    await apiRequest(
+      `/panel/api/inbounds/${inbound.id}/updateClient/${encodeURIComponent(clientId)}`,
+      'POST',
+      { ...client, enable: active, totalGB: total }
+    );
   }
 }
-function getSubscriptionUrl(subId) {
-  return getConfig().panel_url.replace(/\/$/,'')+'/sub/'+subId;
+
+async function deleteClient(email) {
+  if (apiMode === 'clients') {
+    const res = await apiRequest(`/panel/api/clients/del/${encodeURIComponent(email)}?keepTraffic=0`, 'POST');
+    if (res.success === false) throw new Error(res.msg || 'delete failed');
+    return;
+  }
+
+  const inbounds = await getInbounds();
+  for (const inbound of inbounds) {
+    const settings = JSON.parse(inbound.settings || '{}');
+    const client = (settings.clients || []).find(c => c.email === email);
+    if (!client) continue;
+    const clientId = client.id || client.password || client.subId;
+    await apiRequest(`/panel/api/inbounds/${inbound.id}/delClient/${encodeURIComponent(clientId)}`, 'POST');
+  }
 }
-async function getUserStats(email) { return getClientTraffics(email); }
-module.exports = {login,getInbounds,getNewUUID,addClient,updateClient,deleteClient,getClientTraffics,getServerStatus,getOnlineUsers,registerUser,setClientActive,getSubscriptionUrl,getUserStats};
+
+async function getClientTraffic(email) {
+  if (apiMode === 'clients') {
+    const res = await apiRequest(`/panel/api/clients/traffic/${encodeURIComponent(email)}`);
+    return res.obj;
+  }
+  const res = await apiRequest(`/panel/api/inbounds/getClientTraffics/${encodeURIComponent(email)}`);
+  return res.obj;
+}
+
+/** Панель сама подставляет корректные хост/порт из своих настроек. */
+async function getSubscriptionUrl(subId) {
+  if (apiMode === 'clients') {
+    try {
+      const res = await apiRequest(`/panel/api/clients/subLinks/${encodeURIComponent(subId)}`);
+      if (Array.isArray(res.obj) && res.obj.length) {
+        const first = res.obj[0];
+        const url = typeof first === 'string' ? first : (first && first.url);
+        if (url) return url;
+      }
+    } catch (e) {
+      /* эндпоинт недоступен — собираем ссылку вручную */
+    }
+  }
+  const cfg = getConfig();
+  const subPath = cfg.sub_path || '/sub';
+  return `${cfg.panel_url.replace(/\/$/, '')}${subPath}/${subId}`;
+}
+
+module.exports = {
+  login,
+  getApiMode,
+  getInbounds,
+  getServerStatus,
+  getOnlineCount,
+  getClientTraffic,
+  registerUser,
+  getClient,
+  getNewUUID,
+  setClientActive,
+  deleteClient,
+  getSubscriptionUrl,
+  trafficBytes,
+};
 EOF
 
 # src/handlers/user.js
@@ -256,44 +515,149 @@ const QRCode = require('qrcode');
 const { getConfig } = require('../config');
 const db = require('../database');
 const api = require('../api3xui');
-function genSubId(){return Math.random().toString(36).substring(2,15)+Date.now().toString(36)}
+
+const GiB = 1024 * 1024 * 1024;
+
+function genSubId() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let out = '';
+  for (let i = 0; i < 16; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
 async function cmdStart(ctx) {
   const cfg = getConfig();
   const tgId = ctx.from.id;
-  if (await db.getUserByTgId(tgId)) return ctx.reply('ℹ️ Вы уже зарегистрированы. /my_sub — подписка.');
-  const email = 'tg_'+tgId;
-  const uuid = await api.getNewUUID();
+
+  if (await db.getUserByTgId(tgId)) {
+    return ctx.reply('ℹ️ Вы уже зарегистрированы. Используйте /my_sub для просмотра подписки.');
+  }
+
+  const email = `tg_${tgId}`;
   const subId = genSubId();
-  await api.registerUser({email,uuid,subId,tgId:String(tgId)});
-  await db.registerUser({tgId,username:ctx.from.username||'',firstName:ctx.from.first_name||'',email,uuid,subId});
-  let grp='';
-  if(cfg.tg_group_id){try{const l=await ctx.telegram.createChatInviteLink(cfg.tg_group_id,{member_limit:1});grp='\n👥 Группа: '+l.invite_link}catch(e){}}
-  await ctx.reply('✅ Регистрация успешна!\n📋 Email: '+email+'\n🔑 UUID: '+uuid+'\n📊 Лимит: '+cfg.default_traffic_gb+' ГБ\n⏸ Ожидание активации админом'+grp+'\n\nПосле активации: /my_sub');
+
+  try {
+    const inbounds = await api.getInbounds();
+    if (!inbounds.length) {
+      return ctx.reply('❌ В панели нет ни одного inbound — регистрация невозможна.');
+    }
+    const inboundIds = inbounds.map(ib => ib.id);
+
+    const { uuid, total } = await api.registerUser({ email, subId, tgId, inboundIds });
+
+    await db.registerUser({
+      tgId,
+      username: ctx.from.username || '',
+      firstName: ctx.from.first_name || '',
+      email,
+      uuid: uuid || '',
+      subId,
+      trafficLimit: total,
+    });
+
+    // Приглашение в Telegram-группу панели (бот должен быть админом с правом Invite users)
+    let groupLine = '';
+    if (cfg.tg_group_id) {
+      try {
+        const link = await ctx.telegram.createChatInviteLink(cfg.tg_group_id, { member_limit: 1 });
+        groupLine = `\n👥 Группа: ${link.invite_link}`;
+      } catch (e) {
+        // Недостаточно прав в группе — пропускаем без ошибки регистрации
+      }
+    }
+
+    await ctx.reply(
+      `✅ Регистрация успешна!\n\n` +
+      `📋 Ваш email: ${email}\n` +
+      (uuid ? `🔑 UUID: ${uuid}\n` : '') +
+      `🌐 Доступно инбаундов: ${inboundIds.length}\n` +
+      `📊 Лимит трафика: ${cfg.default_traffic_gb} ГБ — общий на все инбаунды\n` +
+      `⏸ Статус: Ожидание активации администратором${groupLine}\n\n` +
+      `После активации используйте /my_sub для получения подписки.`
+    );
+  } catch (err) {
+    await ctx.reply(`❌ Ошибка регистрации: ${err.message}`);
+  }
 }
+
 async function cmdMySub(ctx) {
   const user = await db.getUserByTgId(ctx.from.id);
-  if (!user) return ctx.reply('❌ Нет регистрации. /start');
-  if (!user.is_active) return ctx.reply('⏸ Подписка не активирована.');
-  const url = api.getSubscriptionUrl(user.sub_id);
-  try { const qr=await QRCode.toBuffer(url,{type:'png',width:300}); await ctx.replyWithPhoto({source:qr},{caption:'📱 QR-код:\n'+url}); } catch(e){}
-  await ctx.reply('🔗 '+url);
+  if (!user) {
+    return ctx.reply('❌ Вы не зарегистрированы. Используйте /start для регистрации.');
+  }
+  if (!user.is_active) {
+    return ctx.reply('⏸ Ваша подписка ещё не активирована администратором.');
+  }
+
+  const subUrl = await api.getSubscriptionUrl(user.sub_id);
+
+  try {
+    const qrData = await QRCode.toBuffer(subUrl, { type: 'png', width: 300 });
+    await ctx.replyWithPhoto({ source: qrData }, { caption: `📱 QR-код подписки:\n${subUrl}` });
+  } catch (e) {
+    // не критично, ссылку отправим текстом ниже
+  }
+
+  await ctx.reply(
+    `🔗 Ссылка подписки:\n${subUrl}\n\n` +
+    `Статистика — /stats, список команд — /help`
+  );
 }
+
 async function cmdStats(ctx) {
   const user = await db.getUserByTgId(ctx.from.id);
-  if (!user) return ctx.reply('❌ Нет регистрации.');
+  if (!user) {
+    return ctx.reply('❌ Вы не зарегистрированы. Используйте /start для регистрации.');
+  }
+
   try {
-    const t = await api.getUserStats(user.email);
-    if (!t) return ctx.reply('📊 Статистика недоступна.');
-    await ctx.reply('📊 Статус: '+(t.enable?'🟢':'🔴')+'\n⬆️ '+(t.up/1073741824).toFixed(2)+' ГБ\n⬇️ '+(t.down/1073741824).toFixed(2)+' ГБ\n🔄 '+(t.total/1073741824).toFixed(2)+' ГБ\n📏 Лимит: '+(user.traffic_limit/1073741824).toFixed(0)+' ГБ\n✅ Осталось: '+((user.traffic_limit-t.total)/1073741824).toFixed(2)+' ГБ');
-  } catch(e) { await ctx.reply('❌ '+e.message); }
+    const traffic = await api.getClientTraffic(user.email);
+    if (!traffic) {
+      return ctx.reply('📊 Статистика пока недоступна.');
+    }
+
+    const used = (traffic.up || 0) + (traffic.down || 0);
+    const limit = user.traffic_limit || traffic.total || 0;
+    const remaining = Math.max(0, limit - used);
+    const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+
+    await ctx.reply(
+      `📊 Статистика подписки\n\n` +
+      `📡 Статус: ${traffic.enable ? '🟢 Активен' : '🔴 Неактивен'}\n` +
+      `⬆️ Отдано: ${(traffic.up / GiB).toFixed(2)} ГБ\n` +
+      `⬇️ Скачано: ${(traffic.down / GiB).toFixed(2)} ГБ\n` +
+      `🔄 Израсходовано: ${(used / GiB).toFixed(2)} ГБ (${pct}%)\n` +
+      `📏 Лимит: ${(limit / GiB).toFixed(0)} ГБ\n` +
+      `✅ Остаток: ${(remaining / GiB).toFixed(2)} ГБ\n\n` +
+      `Лимит общий — расходуется суммарно по всем инбаундам.`
+    );
+  } catch (e) {
+    await ctx.reply(`❌ Ошибка получения статистики: ${e.message}`);
+  }
 }
+
 async function cmdHelp(ctx) {
   const cfg = getConfig();
-  let m='📖 /start — регистрация\n/my_sub — подписка+QR\n/stats — статистика';
-  if(String(ctx.from.id)===String(cfg.admin_tg_id)) m+='\n\n👑 /dashboard /users /enable <id> /disable <id> /broadcast <текст> /delete <id>';
-  await ctx.reply(m);
+
+  let msg = `📖 Команды пользователя:\n`;
+  msg += `/start — регистрация\n`;
+  msg += `/my_sub — получить ссылку и QR-код\n`;
+  msg += `/stats — статистика трафика\n`;
+
+  if (String(ctx.from.id) === String(cfg.admin_tg_id)) {
+    msg += `\n👑 Команды админа:\n`;
+    msg += `/dashboard — панель управления\n`;
+    msg += `/users — список пользователей\n`;
+    msg += `/enable <tg_id> — активировать\n`;
+    msg += `/disable <tg_id> — деактивировать\n`;
+    msg += `/broadcast <сообщение> — рассылка всем\n`;
+    msg += `/delete <tg_id> — удалить\n`;
+  }
+
+  await ctx.reply(msg);
 }
-module.exports = {cmdStart,cmdMySub,cmdStats,cmdHelp};
+
+module.exports = { cmdStart, cmdMySub, cmdStats, cmdHelp };
 EOF
 
 # src/handlers/admin.js
@@ -301,107 +665,278 @@ cat > src/handlers/admin.js <<'EOF'
 const { getConfig } = require('../config');
 const db = require('../database');
 const api = require('../api3xui');
-function isAdmin(ctx){return String(ctx.from.id)===String(getConfig().admin_tg_id)}
+
+const GiB = 1024 * 1024 * 1024;
+const MiB = 1024 * 1024;
+
+function fmtGB(bytes) {
+  return (bytes / GiB).toFixed(2) + ' ГБ';
+}
+
 async function cmdDashboard(ctx) {
-  if(!isAdmin(ctx)) return ctx.reply('⛔');
-  try {
-    const users=await db.getAllUsers(),act=users.filter(u=>u.is_active);
-    const st=await api.getServerStatus(),ib=await api.getInbounds(),on=await api.getOnlineUsers();
-    await ctx.reply('📊 Дашборд\n👥 '+users.length+' (🟢'+act.length+' 🔴'+(users.length-act.length)+')\n🌐 Онлайн: '+on.length+'\n📡 Инбаунды: '+ib.length+'\n🖥 Xray: '+(st.xray?'Да':'Нет'));
-  } catch(e){await ctx.reply('❌ '+e.message)}
-}
-async function cmdUsers(ctx) {
-  if(!isAdmin(ctx)) return ctx.reply('⛔');
-  const users=await db.getAllUsers();
-  if(!users.length) return ctx.reply('👥 Нет пользователей.');
-  let m='👥 Пользователи:\n';
-  for(const u of users) m+=(u.is_active?'🟢':'🔴')+' '+u.tg_id+' '+(u.tg_first_name||u.tg_username||'')+'\n';
-  await ctx.reply(m);
-}
-async function cmdEnable(ctx) {
-  if(!isAdmin(ctx)) return ctx.reply('⛔');
-  const id=parseInt(ctx.message.text.split(' ')[1]);
-  if(!id) return ctx.reply('/enable <tg_id>');
-  const u=await db.getUserByTgId(id);
-  if(!u) return ctx.reply('❌ Не найден.');
-  await api.setClientActive(u.email,true);
-  await db.setActive(id,true);
-  await ctx.reply('✅ '+id+' активирован.');
-  try{await ctx.telegram.sendMessage(id,'🎉 Подписка активирована! /my_sub')}catch(e){}
-}
-async function cmdDisable(ctx) {
-  if(!isAdmin(ctx)) return ctx.reply('⛔');
-  const id=parseInt(ctx.message.text.split(' ')[1]);
-  if(!id) return ctx.reply('/disable <tg_id>');
-  const u=await db.getUserByTgId(id);
-  if(!u) return ctx.reply('❌ Не найден.');
-  await api.setClientActive(u.email,false);
-  await db.setActive(id,false);
-  await ctx.reply('🔴 '+id+' деактивирован.');
-}
-async function cmdBroadcast(ctx) {
-  if(!isAdmin(ctx)) return ctx.reply('⛔');
-  const msg=ctx.message.text.substring(ctx.message.text.indexOf(' ')+1);
-  if(!msg||msg===ctx.message.text) return ctx.reply('/broadcast <текст>');
-  const users=await db.getAllUsers();
-  let ok=0,fail=0;
-  for(const u of users){try{await ctx.telegram.sendMessage(u.tg_id,'📢 '+msg);ok++}catch(e){fail++}}
-  await ctx.reply('📢 ok:'+ok+' fail:'+fail);
-}
-async function cmdDelete(ctx) {
-  if(!isAdmin(ctx)) return ctx.reply('⛔');
-  const id=parseInt(ctx.message.text.split(' ')[1]);
-  if(!id) return ctx.reply('/delete <tg_id>');
-  const u=await db.getUserByTgId(id);
-  if(!u) return ctx.reply('❌ Не найден.');
-  const ibs=await api.getInbounds();
-  for(const ib of ibs){
-    const st=JSON.parse(ib.settings||'{}');
-    const c=(st.clients||[]).find(x=>x.email===u.email);
-    if(c) await api.deleteClient(ib.id,c.id||c.password);
+  const cfg = getConfig();
+  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
+    return ctx.reply('⛔ Доступ запрещён.');
   }
-  await db.deleteUser(id);
-  await ctx.reply('🗑 '+id+' удалён.');
+
+  try {
+    const users = await db.getAllUsers();
+    const activeUsers = users.filter(u => u.is_active);
+    const status = await api.getServerStatus();
+    const inbounds = await api.getInbounds();
+    const online = await api.getOnlineCount();
+
+    // Панель отдаёт xray как объект {state, version} и mem как {current, total} в байтах
+    const xrayRunning = status && status.xray && status.xray.state === 'running';
+    const xrayVer = status && status.xray ? status.xray.version : '';
+    const memCur = status && status.mem ? status.mem.current : 0;
+    const memTot = status && status.mem ? status.mem.total : 0;
+
+    const mode = api.getApiMode();
+    const quotaNote = mode === 'clients'
+      ? 'единая квота на все инбаунды'
+      : 'legacy API: лимит применяется к каждому инбаунду';
+
+    await ctx.reply(
+      `📊 Дашборд панели\n\n` +
+      `👥 Всего пользователей: ${users.length}\n` +
+      `🟢 Активных: ${activeUsers.length}\n` +
+      `🔴 Неактивных: ${users.length - activeUsers.length}\n` +
+      `🌐 Онлайн сейчас: ${online.length}\n` +
+      `📡 Инбаундов: ${inbounds.length}\n` +
+      `🖥 Xray: ${xrayRunning ? '🟢 запущен' : '🔴 остановлен'}${xrayVer ? ' (' + xrayVer + ')' : ''}\n` +
+      `💾 CPU: ${status && typeof status.cpu === 'number' ? status.cpu.toFixed(1) + '%' : 'N/A'}\n` +
+      `🧠 RAM: ${memTot ? fmtGB(memCur) + ' из ' + fmtGB(memTot) : 'N/A'}\n` +
+      `📦 Панель: ${status && status.panelVersion ? status.panelVersion : 'N/A'}\n` +
+      `🔌 API: ${mode} (${quotaNote})\n\n` +
+      `Команды: /users /enable /disable /broadcast /delete`
+    );
+  } catch (e) {
+    await ctx.reply(`❌ Ошибка: ${e.message}`);
+  }
 }
-module.exports={cmdDashboard,cmdUsers,cmdEnable,cmdDisable,cmdBroadcast,cmdDelete};
+
+async function cmdUsers(ctx) {
+  const cfg = getConfig();
+  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
+    return ctx.reply('⛔ Доступ запрещён.');
+  }
+
+  const users = await db.getAllUsers();
+  if (users.length === 0) {
+    return ctx.reply('👥 Пользователей пока нет.');
+  }
+
+  let msg = `👥 Список пользователей (${users.length}):\n\n`;
+  for (const u of users) {
+    const status = u.is_active ? '🟢' : '🔴';
+    const name = u.tg_first_name || u.tg_username || 'без имени';
+    let used = '';
+    try {
+      const t = await api.getClientTraffic(u.email);
+      if (t) used = ` — ${fmtGB((t.up || 0) + (t.down || 0))} из ${fmtGB(u.traffic_limit || 0)}`;
+    } catch (e) {
+      // у пользователя мог отсутствовать клиент — показываем без трафика
+    }
+    msg += `${status} ${u.tg_id} — ${name} (@${u.tg_username || 'нет'})${used}\n`;
+  }
+
+  await ctx.reply(msg);
+}
+
+async function cmdEnable(ctx) {
+  const cfg = getConfig();
+  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
+    return ctx.reply('⛔ Доступ запрещён.');
+  }
+
+  const text = ctx.message.text;
+  const parts = text.split(' ');
+  const targetId = parseInt(parts[1]);
+
+  if (!targetId) {
+    return ctx.reply('Использование: /enable <tg_id>');
+  }
+
+  const user = await db.getUserByTgId(targetId);
+  if (!user) {
+    return ctx.reply(`❌ Пользователь ${targetId} не найден.`);
+  }
+
+  try {
+    await api.setClientActive(user.email, true);
+    await db.setActive(targetId, true);
+    await ctx.reply(`✅ Пользователь ${targetId} активирован.`);
+
+    // Notify user
+    try {
+      await ctx.telegram.sendMessage(targetId, '🎉 Ваша подписка активирована! Используйте /my_sub для получения ссылки.');
+    } catch (e) {
+      // user may have blocked bot
+    }
+  } catch (e) {
+    await ctx.reply(`❌ Ошибка: ${e.message}`);
+  }
+}
+
+async function cmdDisable(ctx) {
+  const cfg = getConfig();
+  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
+    return ctx.reply('⛔ Доступ запрещён.');
+  }
+
+  const text = ctx.message.text;
+  const parts = text.split(' ');
+  const targetId = parseInt(parts[1]);
+
+  if (!targetId) {
+    return ctx.reply('Использование: /disable <tg_id>');
+  }
+
+  const user = await db.getUserByTgId(targetId);
+  if (!user) {
+    return ctx.reply(`❌ Пользователь ${targetId} не найден.`);
+  }
+
+  try {
+    await api.setClientActive(user.email, false);
+    await db.setActive(targetId, false);
+    await ctx.reply(`🔴 Пользователь ${targetId} деактивирован.`);
+  } catch (e) {
+    await ctx.reply(`❌ Ошибка: ${e.message}`);
+  }
+}
+
+async function cmdBroadcast(ctx) {
+  const cfg = getConfig();
+  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
+    return ctx.reply('⛔ Доступ запрещён.');
+  }
+
+  const text = ctx.message.text;
+  const message = text.substring(text.indexOf(' ') + 1);
+
+  if (!message || message === text) {
+    return ctx.reply('Использование: /broadcast <сообщение>');
+  }
+
+  const users = await db.getAllUsers();
+  let sent = 0;
+  let failed = 0;
+
+  for (const u of users) {
+    try {
+      await ctx.telegram.sendMessage(u.tg_id, `📢 ${message}`);
+      sent++;
+    } catch (e) {
+      failed++;
+    }
+  }
+
+  await ctx.reply(`📢 Рассылка завершена.\n✅ Доставлено: ${sent}\n❌ Не доставлено: ${failed}`);
+}
+
+async function cmdDelete(ctx) {
+  const cfg = getConfig();
+  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
+    return ctx.reply('⛔ Доступ запрещён.');
+  }
+
+  const text = ctx.message.text;
+  const parts = text.split(' ');
+  const targetId = parseInt(parts[1]);
+
+  if (!targetId) {
+    return ctx.reply('Использование: /delete <tg_id>');
+  }
+
+  const user = await db.getUserByTgId(targetId);
+  if (!user) {
+    return ctx.reply(`❌ Пользователь ${targetId} не найден.`);
+  }
+
+  try {
+    await api.deleteClient(user.email);
+    await db.deleteUser(targetId);
+    await ctx.reply(`🗑 Пользователь ${targetId} удалён.`);
+  } catch (e) {
+    await ctx.reply(`❌ Ошибка: ${e.message}`);
+  }
+}
+
+module.exports = { cmdDashboard, cmdUsers, cmdEnable, cmdDisable, cmdBroadcast, cmdDelete };
 EOF
 
 # src/index.js
 cat > src/index.js <<'EOF'
 const { Telegraf } = require('telegraf');
 const { getConfig } = require('./config');
+const db = require('./database');
 const api = require('./api3xui');
-const u = require('./handlers/user');
-const a = require('./handlers/admin');
+const userHandlers = require('./handlers/user');
+const adminHandlers = require('./handlers/admin');
+
 async function main() {
   const cfg = getConfig();
   const bot = new Telegraf(cfg.bot_token);
+
+  // Login to 3x-ui panel
   await api.login();
-  console.log('✅ Panel OK');
+  console.log('✅ Logged in to 3x-ui panel');
+
+  // Set bot commands
   await bot.telegram.setMyCommands([
-    {command:'start',description:'Регистрация'},
-    {command:'my_sub',description:'Подписка'},
-    {command:'stats',description:'Статистика'},
-    {command:'help',description:'Помощь'}
+    { command: 'start', description: 'Регистрация' },
+    { command: 'my_sub', description: 'Моя подписка' },
+    { command: 'stats', description: 'Статистика' },
+    { command: 'help', description: 'Помощь' },
   ]);
-  bot.start(u.cmdStart);
-  bot.command('my_sub',u.cmdMySub);
-  bot.command('stats',u.cmdStats);
-  bot.command('help',u.cmdHelp);
-  bot.command('dashboard',a.cmdDashboard);
-  bot.command('users',a.cmdUsers);
-  bot.command('enable',a.cmdEnable);
-  bot.command('disable',a.cmdDisable);
-  bot.command('broadcast',a.cmdBroadcast);
-  bot.command('delete',a.cmdDelete);
-  bot.catch((e,ctx)=>{console.error(e);try{ctx.reply('❌ Ошибка')}catch(x){}});
-  const opts={};
-  if(cfg.webhook_domain&&cfg.webhook_secret){opts.domain=cfg.webhook_domain;opts.secretToken=cfg.webhook_secret;opts.port=cfg.webhook_port||8443;}
-  await bot.launch(opts,()=>console.log('🤖 @'+bot.botInfo.username+' running'));
-  process.once('SIGINT',()=>bot.stop('SIGINT'));
-  process.once('SIGTERM',()=>bot.stop('SIGTERM'));
+
+  // User commands
+  bot.start(userHandlers.cmdStart);
+  bot.command('my_sub', userHandlers.cmdMySub);
+  bot.command('stats', userHandlers.cmdStats);
+  bot.command('help', userHandlers.cmdHelp);
+
+  // Admin commands
+  bot.command('dashboard', adminHandlers.cmdDashboard);
+  bot.command('users', adminHandlers.cmdUsers);
+  bot.command('enable', adminHandlers.cmdEnable);
+  bot.command('disable', adminHandlers.cmdDisable);
+  bot.command('broadcast', adminHandlers.cmdBroadcast);
+  bot.command('delete', adminHandlers.cmdDelete);
+
+  // Error handling
+  bot.catch((err, ctx) => {
+    console.error('Bot error:', err);
+    ctx.reply(`❌ Внутренняя ошибка: ${err.message}`);
+  });
+
+  // Launch
+  const launchOpts = {};
+  if (cfg.webhook_domain && cfg.webhook_secret) {
+    launchOpts.domain = cfg.webhook_domain;
+    launchOpts.secretToken = cfg.webhook_secret;
+    launchOpts.port = cfg.webhook_port || 8443;
+    launchOpts.healthCheck = { enabled: true, path: '/health' };
+  }
+
+  await bot.launch(launchOpts, () => {
+    console.log(`🤖 Bot @${bot.botInfo.username} is running`);
+    if (launchOpts.domain) {
+      console.log(`   Webhook: https://${launchOpts.domain}:${launchOpts.port}`);
+    }
+  });
+
+  // Graceful shutdown
+  process.once('SIGINT', () => bot.stop('SIGINT'));
+  process.once('SIGTERM', () => bot.stop('SIGTERM'));
 }
-main().catch(e=>{console.error('Fatal:',e);process.exit(1)});
+
+main().catch(err => {
+  console.error('Fatal:', err);
+  process.exit(1);
+});
 EOF
 
 # Install dependencies
