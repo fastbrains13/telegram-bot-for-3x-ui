@@ -1,0 +1,19 @@
+{
+  "name": "telegram-bot-3x-ui",
+  "version": "1.0.0",
+  "description": "Telegram bot for 3x-ui panel user registration and management",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "sql.js": "^1.11.0",
+    "telegraf": "^4.16.3",
+    "undici": "^6.19.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
