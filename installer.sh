@@ -99,7 +99,7 @@ cat > package.json <<'EOJSON'
   "version": "1.0.0",
   "description": "Telegram bot for 3x-ui panel",
   "main": "src/index.js",
-  "scripts": { "start": "node src/index.js" },
+  "scripts": { "start": "node src/index.js", "dev": "node --watch src/index.js" },
   "dependencies": {
     "qrcode": "^1.5.4",
     "sql.js": "^1.11.0",
@@ -266,7 +266,9 @@ async function cmdStart(ctx) {
   const subId = genSubId();
   await api.registerUser({email,uuid,subId,tgId:String(tgId)});
   await db.registerUser({tgId,username:ctx.from.username||'',firstName:ctx.from.first_name||'',email,uuid,subId});
-  await ctx.reply('✅ Регистрация успешна!\n📋 Email: '+email+'\n🔑 UUID: '+uuid+'\n📊 Лимит: '+cfg.default_traffic_gb+' ГБ\n⏸ Ожидание активации админом\n\nПосле активации: /my_sub');
+  let grp='';
+  if(cfg.tg_group_id){try{const l=await ctx.telegram.createChatInviteLink(cfg.tg_group_id,{member_limit:1});grp='\n👥 Группа: '+l.invite_link}catch(e){}}
+  await ctx.reply('✅ Регистрация успешна!\n📋 Email: '+email+'\n🔑 UUID: '+uuid+'\n📊 Лимит: '+cfg.default_traffic_gb+' ГБ\n⏸ Ожидание активации админом'+grp+'\n\nПосле активации: /my_sub');
 }
 async function cmdMySub(ctx) {
   const user = await db.getUserByTgId(ctx.from.id);

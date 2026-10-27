@@ -37,12 +37,14 @@ async function cmdStart(ctx) {
       subId,
     });
 
-    // Try to add user to TG group
+    // Приглашение в Telegram-группу панели (бот должен быть админом с правом Invite users)
+    let groupLine = '';
     if (cfg.tg_group_id) {
       try {
-        await ctx.telegram.createChatInviteLink(cfg.tg_group_id, { member_limit: 10000 });
+        const link = await ctx.telegram.createChatInviteLink(cfg.tg_group_id, { member_limit: 1 });
+        groupLine = `\n👥 Группа: ${link.invite_link}`;
       } catch (e) {
-        // Bot might not have admin rights in group
+        // Недостаточно прав в группе — пропускаем без ошибки регистрации
       }
     }
 
@@ -51,7 +53,7 @@ async function cmdStart(ctx) {
       `📋 Ваш email: \`${email}\`\n` +
       `🔑 UUID: \`${uuid}\`\n` +
       `📊 Лимит трафика: ${cfg.default_traffic_gb} ГБ\n` +
-      `⏸ Статус: Ожидание активации администратором\n\n` +
+      `⏸ Статус: Ожидание активации администратором${groupLine}\n\n` +
       `После активации используйте /my_sub для получения подписки.`,
       { parse_mode: 'Markdown' }
     );
