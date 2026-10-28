@@ -52,8 +52,14 @@ read -sp "Пароль 3x-ui (или пусто если API-токен): " PANE
 echo ""
 read -rp "API-токен 3x-ui (Bearer, или пусто): " API_TOKEN
 read -rp "ID Telegram-группы (напр. -100xxx, или пусто): " TG_GROUP_ID
+GROUP_LINK=""
+if [ -n "$TG_GROUP_ID" ]; then
+  read -rp "Публичная ссылка группы (напр. https://t.me/mygroup, или пусто): " GROUP_LINK
+fi
 read -rp "Лимит трафика по умолчанию, ГБ [100]: " TRAFFIC_GB
 TRAFFIC_GB=${TRAFFIC_GB:-100}
+read -rp "Путь подписки в панели [sub]: " SUB_PATH
+SUB_PATH=${SUB_PATH:-sub}
 read -rp "Домен для webhook (или пусто = polling): " WEBHOOK_DOMAIN
 WEBHOOK_SECRET=""
 WEBHOOK_PORT=8443
@@ -83,7 +89,9 @@ cat > data/config.json <<EOCFG
   "panel_password": "${PANEL_PASSWORD}",
   "api_token": "${API_TOKEN}",
   "tg_group_id": "${TG_GROUP_ID}",
+  "group_link": "${GROUP_LINK}",
   "default_traffic_gb": ${TRAFFIC_GB},
+  "sub_path": "/${SUB_PATH}",
   "webhook_domain": "${WEBHOOK_DOMAIN}",
   "webhook_secret": "${WEBHOOK_SECRET}",
   "webhook_port": ${WEBHOOK_PORT}
@@ -125,6 +133,9 @@ function loadConfig() {
     throw new Error('Config file not found. Run installer first.');
   }
   config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  // Значения по умолчанию для полей, добавленных после установки
+  if (config.sub_path === undefined) config.sub_path = '/sub';
+  if (config.group_link === undefined) config.group_link = '';
   return config;
 }
 
@@ -171,13 +182,26 @@ async function getDb() {
       registered_at INTEGER NOT NULL,
       is_active INTEGER DEFAULT 0,
       traffic_limit INTEGER DEFAULT 107374182400,
-      used_traffic INTEGER DEFAULT 0
+      used_traffic INTEGER DEFAULT 0,
+      group_joined INTEGER DEFAULT 0,
+      group_invite_link TEXT
     );
     CREATE TABLE IF NOT EXISTS admin_settings (
       key TEXT PRIMARY KEY,
       value TEXT
     );
   `);
+  // Миграция для баз, созданных до появления обязательной привязки к группе
+  const cols = db.exec('PRAGMA table_info(users)');
+  const names = cols.length ? cols[0].values.map(v => v[1]) : [];
+  if (!names.includes('group_joined')) {
+    db.run('ALTER TABLE users ADD COLUMN group_joined INTEGER DEFAULT 0');
+    saveDb();
+  }
+  if (!names.includes('group_invite_link')) {
+    db.run('ALTER TABLE users ADD COLUMN group_invite_link TEXT');
+    saveDb();
+  }
   return db;
 }
 
@@ -225,6 +249,16 @@ async function setActive(tgId, isActive) {
   saveDb();
 }
 
+async function setGroupJoined(tgId, joined, inviteLink) {
+  const d = await getDb();
+  const link = inviteLink ? `'${String(inviteLink).replace(/'/g, "''")}'` : 'NULL';
+  d.run(
+    'UPDATE users SET group_joined = ' + (joined ? 1 : 0) + ', group_invite_link = ' + link +
+    ' WHERE tg_id = ' + Number(tgId)
+  );
+  saveDb();
+}
+
 async function deleteUser(tgId) {
   const d = await getDb();
   d.run('DELETE FROM users WHERE tg_id = ' + Number(tgId));
@@ -238,6 +272,7 @@ module.exports = {
   getUserByTgId,
   getAllUsers,
   setActive,
+  setGroupJoined,
   deleteUser,
 };
 EOF
@@ -489,23 +524,85 @@ async function getClientTraffic(email) {
   return res.obj;
 }
 
-/** Панель сама подставляет корректные хост/порт из своих настроек. */
+/**
+ * Ссылка именно на ПОДПИСКУ (sub), а не на конфигурацию.
+ * Эндпоинт /clients/subLinks отдаёт готовые конфиги (vless://, trojan://),
+ * поэтому ссылка собирается вручную из настроек панели: {panel_url}{sub_path}/{subId}.
+ */
 async function getSubscriptionUrl(subId) {
+  const cfg = getConfig();
+  const subPath = (cfg.sub_path || '/sub').replace(/\/+$/, '');
+  return `${cfg.panel_url.replace(/\/$/, '')}${subPath}/${subId}`;
+}
+
+/**
+ * Все клиенты панели (не только зарегистрированные ботом).
+ * В clients-режиме /clients/list отдаёт сразу всех; в legacy клиенты
+ * лежат внутри settings каждого инбаунда.
+ */
+async function getPanelClients() {
   if (apiMode === 'clients') {
+    const res = await apiRequest('/panel/api/clients/list');
+    const rows = Array.isArray(res.obj) ? res.obj : [];
+    return rows.map(c => ({
+      email: c.email,
+      subId: c.subId || '',
+      uuid: c.uuid || c.id || '',
+      tgId: c.tgId || 0,
+      enable: !!c.enable,
+      total: c.totalGB || (c.traffic && c.traffic.total) || 0,
+      up: (c.traffic && c.traffic.up) || 0,
+      down: (c.traffic && c.traffic.down) || 0,
+      expiryTime: c.expiryTime || 0,
+      comment: c.comment || '',
+      online: false,
+    }));
+  }
+
+  const inbounds = await getInbounds();
+  const byEmail = new Map();
+  for (const inbound of inbounds) {
+    let settings;
     try {
-      const res = await apiRequest(`/panel/api/clients/subLinks/${encodeURIComponent(subId)}`);
-      if (Array.isArray(res.obj) && res.obj.length) {
-        const first = res.obj[0];
-        const url = typeof first === 'string' ? first : (first && first.url);
-        if (url) return url;
-      }
+      settings = JSON.parse(inbound.settings || '{}');
     } catch (e) {
-      /* эндпоинт недоступен — собираем ссылку вручную */
+      continue;
+    }
+    for (const c of settings.clients || []) {
+      if (!c.email) continue;
+      if (!byEmail.has(c.email)) {
+        byEmail.set(c.email, {
+          email: c.email,
+          subId: c.subId || '',
+          uuid: c.id || c.password || '',
+          tgId: Number(c.tgId) || 0,
+          enable: !!c.enable,
+          total: c.totalGB || 0,
+          up: 0,
+          down: 0,
+          expiryTime: c.expiryTime || 0,
+          comment: c.comment || '',
+          online: false,
+        });
+      }
     }
   }
-  const cfg = getConfig();
-  const subPath = cfg.sub_path || '/sub';
-  return `${cfg.panel_url.replace(/\/$/, '')}${subPath}/${subId}`;
+
+  // В 2.x трафик хранится отдельной строкой на email — он и даёт общую картину
+  for (const [email, c] of byEmail) {
+    try {
+      const t = await getClientTraffic(email);
+      if (t) {
+        c.up = t.up || 0;
+        c.down = t.down || 0;
+        c.enable = t.enable !== undefined ? !!t.enable : c.enable;
+        if (t.total) c.total = t.total;
+      }
+    } catch (e) {
+      /* статистики ещё нет */
+    }
+  }
+  return [...byEmail.values()];
 }
 
 module.exports = {
@@ -515,6 +612,7 @@ module.exports = {
   getServerStatus,
   getOnlineCount,
   getClientTraffic,
+  getPanelClients,
   registerUser,
   getClient,
   getNewUUID,
@@ -528,6 +626,7 @@ EOF
 # src/handlers/user.js
 cat > src/handlers/user.js <<'EOF'
 const QRCode = require('qrcode');
+const { Markup } = require('telegraf');
 const { getConfig } = require('../config');
 const db = require('../database');
 const api = require('../api3xui');
@@ -541,12 +640,76 @@ function genSubId() {
   return out;
 }
 
+function isAdmin(ctx) {
+  return String(ctx.from.id) === String(getConfig().admin_tg_id);
+}
+
+/** Главное меню — inline-кнопки вместо перечисления команд текстом. */
+function mainKeyboard(ctx, cfg) {
+  const rows = [];
+  if (cfg.tg_group_id && cfg.group_link) {
+    rows.push([Markup.button.url('👥 Наша группа', cfg.group_link)]);
+  }
+  rows.push(
+    [
+      Markup.button.callback('🔗 Подписка', 'menu:sub'),
+      Markup.button.callback('📊 Статистика', 'menu:stats'),
+    ],
+    [
+      Markup.button.callback('📱 QR-код', 'menu:qr'),
+      Markup.button.callback('📖 Помощь', 'menu:help'),
+    ]
+  );
+  if (isAdmin(ctx)) {
+    rows.push([Markup.button.callback('👑 Панель администратора', 'menu:admin')]);
+  }
+  return Markup.inlineKeyboard(rows);
+}
+
+/**
+ * Ссылка-приглашение в группу выдаётся всегда:
+ * сначала персональная ссылка (бот-админ с Invite users),
+ * при неудаче — публичная ссылка из конфига.
+ */
+async function getGroupLink(ctx, cfg) {
+  if (!cfg.tg_group_id) return { link: '', required: false };
+
+  try {
+    const inv = await ctx.telegram.createChatInviteLink(cfg.tg_group_id, {
+      member_limit: 100000,
+      name: `bot_user_${ctx.from.id}`,
+    });
+    if (inv && inv.invite_link) return { link: inv.invite_link, required: true };
+  } catch (e) {
+    // нет прав админа в группе — переходим к публичной ссылке
+  }
+
+  if (cfg.group_link) return { link: cfg.group_link, required: true };
+
+  throw new Error(
+    'не удалось получить ссылку-приглашение в группу. Добавьте бота админом в группу ' +
+    'с правом «Invite users» или пропишите публичную ссылку в data/config.json → group_link.'
+  );
+}
+
+/** Проверка членства в группе. */
+async function isGroupMember(ctx, tgId) {
+  const cfg = getConfig();
+  if (!cfg.tg_group_id) return true;
+  try {
+    const member = await ctx.telegram.getChatMember(cfg.tg_group_id, tgId);
+    return ['creator', 'administrator', 'member'].includes(member.status);
+  } catch (e) {
+    return false;
+  }
+}
+
 async function cmdStart(ctx) {
   const cfg = getConfig();
   const tgId = ctx.from.id;
 
   if (await db.getUserByTgId(tgId)) {
-    return ctx.reply('ℹ️ Вы уже зарегистрированы. Используйте /my_sub для просмотра подписки.');
+    return ctx.reply('ℹ️ Вы уже зарегистрированы. Откройте подписку кнопкой ниже.', mainKeyboard(ctx, cfg));
   }
 
   const email = `tg_${tgId}`;
@@ -571,129 +734,246 @@ async function cmdStart(ctx) {
       trafficLimit: total,
     });
 
-    // Приглашение в Telegram-группу панели (бот должен быть админом с правом Invite users)
-    let groupLine = '';
-    if (cfg.tg_group_id) {
-      try {
-        const link = await ctx.telegram.createChatInviteLink(cfg.tg_group_id, { member_limit: 1 });
-        groupLine = `\n👥 Группа: ${link.invite_link}`;
-      } catch (e) {
-        // Недостаточно прав в группе — пропускаем без ошибки регистрации
-      }
+    // Привязка к группе обязательна: без неё регистрация не завершена
+    let group = { link: '', required: false };
+    try {
+      group = await getGroupLink(ctx, cfg);
+    } catch (e) {
+      await api.deleteClient(email);
+      await db.deleteUser(tgId);
+      return ctx.reply(`❌ Регистрация отменена: ${e.message}`);
+    }
+
+    if (group.required) {
+      await db.setGroupJoined(tgId, false, group.link);
+      const joined = await isGroupMember(ctx, tgId);
+      if (joined) await db.setGroupJoined(tgId, true, group.link);
+
+      return ctx.reply(
+        `✅ Аккаунт создан, но нужно вступить в группу.\n\n` +
+        `📋 Email: ${email}\n` +
+        `📊 Лимит: ${cfg.default_traffic_gb} ГБ — общий на все инбаунды\n` +
+        `⏸ Доступ активирует администратор\n\n` +
+        `👉 Нажмите «Вступить в группу», затем «Я вступил». ` +
+        `Пока вы в группе не подтверждены, подписка не откроется.`,
+        Markup.inlineKeyboard([
+          [Markup.button.url('👥 Вступить в группу', group.link)],
+          [Markup.button.callback(joined ? '✅ Вы в группе' : '✔️ Я вступил', 'grp:check')],
+        ])
+      );
     }
 
     await ctx.reply(
       `✅ Регистрация успешна!\n\n` +
-      `📋 Ваш email: ${email}\n` +
-      (uuid ? `🔑 UUID: ${uuid}\n` : '') +
-      `🌐 Доступно инбаундов: ${inboundIds.length}\n` +
-      `📊 Лимит трафика: ${cfg.default_traffic_gb} ГБ — общий на все инбаунды\n` +
-      `⏸ Статус: Ожидание активации администратором${groupLine}\n\n` +
-      `После активации используйте /my_sub для получения подписки.`
+      `📋 Email: ${email}\n` +
+      `🌐 Инбаундов: ${inboundIds.length}\n` +
+      `📊 Лимит: ${cfg.default_traffic_gb} ГБ — общий на все инбаунды\n` +
+      `⏸ Ожидание активации администратором`,
+      mainKeyboard(ctx, cfg)
     );
   } catch (err) {
     await ctx.reply(`❌ Ошибка регистрации: ${err.message}`);
   }
 }
 
-async function cmdMySub(ctx) {
-  const user = await db.getUserByTgId(ctx.from.id);
-  if (!user) {
-    return ctx.reply('❌ Вы не зарегистрированы. Используйте /start для регистрации.');
-  }
-  if (!user.is_active) {
-    return ctx.reply('⏸ Ваша подписка ещё не активирована администратором.');
-  }
+/** Кнопка «Я вступил» — проверяем состав группы. */
+async function onGroupCheck(ctx) {
+  const tgId = ctx.from.id;
+  const user = await db.getUserByTgId(tgId);
+  if (!user) return ctx.answerCbQuery('Сначала нажмите /start');
 
-  const subUrl = await api.getSubscriptionUrl(user.sub_id);
-
-  try {
-    const qrData = await QRCode.toBuffer(subUrl, { type: 'png', width: 300 });
-    await ctx.replyWithPhoto({ source: qrData }, { caption: `📱 QR-код подписки:\n${subUrl}` });
-  } catch (e) {
-    // не критично, ссылку отправим текстом ниже
+  const joined = await isGroupMember(ctx, tgId);
+  if (!joined) {
+    await db.setGroupJoined(tgId, false, user.group_invite_link || '');
+    return ctx.answerCbQuery('❌ Вас нет в группе — вступите и нажмите снова', { show_alert: true });
   }
 
-  await ctx.reply(
-    `🔗 Ссылка подписки:\n${subUrl}\n\n` +
-    `Статистика — /stats, список команд — /help`
+  await db.setGroupJoined(tgId, true, user.group_invite_link || '');
+  await ctx.answerCbQuery('✅ Группа подтверждена');
+  return ctx.reply(
+    `✅ Группа подтверждена!\n\n⏸ Осталось дождаться активации подписки администратором.`,
+    mainKeyboard(ctx, getConfig())
   );
 }
 
-async function cmdStats(ctx) {
+async function sendSubLink(ctx, user) {
+  const subUrl = await api.getSubscriptionUrl(user.sub_id);
+  return ctx.reply(
+    `🔗 Ссылка подписки — вставьте её в приложение:\n${subUrl}\n\n` +
+    `📱 QR-код — по кнопке ниже.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('📱 Показать QR-код', 'sub:qr')],
+      [Markup.button.callback('📊 Статистика', 'menu:stats')],
+    ])
+  );
+}
+
+async function cmdMySub(ctx) {
   const user = await db.getUserByTgId(ctx.from.id);
   if (!user) {
-    return ctx.reply('❌ Вы не зарегистрированы. Используйте /start для регистрации.');
+    return ctx.reply('❌ Вы не зарегистрированы. Нажмите /start для регистрации.');
   }
 
+  // Подписка доступна только привязанным к группе
+  if (getConfig().tg_group_id && !user.group_joined) {
+    const rows = [];
+    if (user.group_invite_link) {
+      rows.push([Markup.button.url('👥 Вступить в группу', user.group_invite_link)]);
+    }
+    rows.push([Markup.button.callback('✔️ Я вступил', 'grp:check')]);
+    return ctx.reply('⛔ Подписка доступна только после вступления в нашу Telegram-группу.', Markup.inlineKeyboard(rows));
+  }
+
+  if (!user.is_active) {
+    return ctx.reply('⏸ Ваша подписка ещё не активирована администратором.', mainKeyboard(ctx, getConfig()));
+  }
+
+  return sendSubLink(ctx, user);
+}
+
+/** QR отправляем отдельным сообщением — по нажатию кнопки. */
+async function sendQr(ctx, user) {
+  const subUrl = await api.getSubscriptionUrl(user.sub_id);
+  try {
+    const qr = await QRCode.toBuffer(subUrl, { type: 'png', width: 400, margin: 2 });
+    return ctx.replyWithPhoto({ source: qr }, { caption: `📱 QR-код подписки\n${subUrl}` });
+  } catch (e) {
+    return ctx.reply(`❌ Не удалось сгенерировать QR: ${e.message}`);
+  }
+}
+
+async function onQrButton(ctx) {
+  const user = await db.getUserByTgId(ctx.from.id);
+  if (!user) return ctx.answerCbQuery('Сначала нажмите /start');
+  if (getConfig().tg_group_id && !user.group_joined) {
+    return ctx.answerCbQuery('⛔ Сначала вступите в группу', { show_alert: true });
+  }
+  if (!user.is_active) {
+    return ctx.answerCbQuery('⏸ Подписка ещё не активирована', { show_alert: true });
+  }
+  await ctx.answerCbQuery('Готовлю QR…');
+  return sendQr(ctx, user);
+}
+
+async function sendStats(ctx, user) {
   try {
     const traffic = await api.getClientTraffic(user.email);
     if (!traffic) {
-      return ctx.reply('📊 Статистика пока недоступна.');
+      return ctx.reply('📊 Статистика пока недоступна.', mainKeyboard(ctx, getConfig()));
     }
 
     const used = (traffic.up || 0) + (traffic.down || 0);
     const limit = user.traffic_limit || traffic.total || 0;
     const remaining = Math.max(0, limit - used);
     const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+    const filled = Math.round(pct / 10);
+    const bar = '▓'.repeat(filled) + '░'.repeat(10 - filled);
 
     await ctx.reply(
       `📊 Статистика подписки\n\n` +
       `📡 Статус: ${traffic.enable ? '🟢 Активен' : '🔴 Неактивен'}\n` +
-      `⬆️ Отдано: ${(traffic.up / GiB).toFixed(2)} ГБ\n` +
       `⬇️ Скачано: ${(traffic.down / GiB).toFixed(2)} ГБ\n` +
+      `⬆️ Отдано: ${(traffic.up / GiB).toFixed(2)} ГБ\n` +
       `🔄 Израсходовано: ${(used / GiB).toFixed(2)} ГБ (${pct}%)\n` +
-      `📏 Лимит: ${(limit / GiB).toFixed(0)} ГБ\n` +
-      `✅ Остаток: ${(remaining / GiB).toFixed(2)} ГБ\n\n` +
-      `Лимит общий — расходуется суммарно по всем инбаундам.`
+      `${bar}\n` +
+      `📏 Лимит: ${(limit / GiB).toFixed(0)} ГБ — общий на все инбаунды\n` +
+      `✅ Остаток: ${(remaining / GiB).toFixed(2)} ГБ`,
+      mainKeyboard(ctx, getConfig())
     );
   } catch (e) {
     await ctx.reply(`❌ Ошибка получения статистики: ${e.message}`);
   }
 }
 
-async function cmdHelp(ctx) {
-  const cfg = getConfig();
-
-  let msg = `📖 Команды пользователя:\n`;
-  msg += `/start — регистрация\n`;
-  msg += `/my_sub — получить ссылку и QR-код\n`;
-  msg += `/stats — статистика трафика\n`;
-
-  if (String(ctx.from.id) === String(cfg.admin_tg_id)) {
-    msg += `\n👑 Команды админа:\n`;
-    msg += `/dashboard — панель управления\n`;
-    msg += `/users — список пользователей\n`;
-    msg += `/enable <tg_id> — активировать\n`;
-    msg += `/disable <tg_id> — деактивировать\n`;
-    msg += `/broadcast <сообщение> — рассылка всем\n`;
-    msg += `/delete <tg_id> — удалить\n`;
+async function cmdStats(ctx) {
+  const user = await db.getUserByTgId(ctx.from.id);
+  if (!user) {
+    return ctx.reply('❌ Вы не зарегистрированы. Нажмите /start для регистрации.');
   }
-
-  await ctx.reply(msg);
+  return sendStats(ctx, user);
 }
 
-module.exports = { cmdStart, cmdMySub, cmdStats, cmdHelp };
+async function cmdHelp(ctx) {
+  const cfg = getConfig();
+  await ctx.reply(
+    `📖 Как пользоваться ботом\n\n` +
+    `1️⃣ /start — регистрация, клиент создаётся во всех инбаундах\n` +
+    `2️⃣ Вступление в Telegram-группу — обязательно\n` +
+    `3️⃣ Активация администратором\n` +
+    `4️⃣ «Подписка» — ссылка для приложения, «QR-код» — картинка для телефона\n\n` +
+    `📏 Лимит ${cfg.default_traffic_gb} ГБ расходуется суммарно по всем инбаундам.\n\n` +
+    `Все действия — кнопками ниже.`,
+    mainKeyboard(ctx, cfg)
+  );
+}
+
+/** Нажатия кнопок главного меню. */
+async function onMenuCallback(ctx) {
+  const data = (ctx.callbackQuery && ctx.callbackQuery.data) || '';
+  const cfg = getConfig();
+
+  if (data === 'menu:sub') {
+    await ctx.answerCbQuery();
+    return cmdMySub(ctx);
+  }
+  if (data === 'menu:stats') {
+    await ctx.answerCbQuery();
+    const user = await db.getUserByTgId(ctx.from.id);
+    if (!user) return ctx.reply('❌ Вы не зарегистрированы. Нажмите /start.');
+    return sendStats(ctx, user);
+  }
+  if (data === 'menu:qr') return onQrButton(ctx);
+  if (data === 'menu:help') {
+    await ctx.answerCbQuery();
+    return cmdHelp(ctx);
+  }
+  if (data === 'menu:admin') {
+    await ctx.answerCbQuery();
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
+    return require('./admin').cmdDashboard(ctx);
+  }
+  return ctx.answerCbQuery();
+}
+
+module.exports = {
+  cmdStart,
+  cmdMySub,
+  cmdStats,
+  cmdHelp,
+  sendQr,
+  mainKeyboard,
+  onGroupCheck,
+  onQrButton,
+  onMenuCallback,
+  isGroupMember,
+};
 EOF
 
 # src/handlers/admin.js
 cat > src/handlers/admin.js <<'EOF'
+const { Markup } = require('telegraf');
 const { getConfig } = require('../config');
 const db = require('../database');
 const api = require('../api3xui');
 
 const GiB = 1024 * 1024 * 1024;
-const MiB = 1024 * 1024;
+const PAGE_SIZE = 10;
 
 function fmtGB(bytes) {
   return (bytes / GiB).toFixed(2) + ' ГБ';
 }
 
+function isAdmin(ctx) {
+  return String(ctx.from.id) === String(getConfig().admin_tg_id);
+}
+
+/** Ссылка на команду с предзаполненным текстом — «быстрая ссылка» на /enable, /disable. */
+function cmdLink(botUsername, command, arg) {
+  return `https://t.me/${botUsername}?text=/${command}%20${arg}`;
+}
+
 async function cmdDashboard(ctx) {
-  const cfg = getConfig();
-  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
-    return ctx.reply('⛔ Доступ запрещён.');
-  }
+  if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
 
   try {
     const users = await db.getAllUsers();
@@ -702,136 +982,218 @@ async function cmdDashboard(ctx) {
     const inbounds = await api.getInbounds();
     const online = await api.getOnlineCount();
 
-    // Панель отдаёт xray как объект {state, version} и mem как {current, total} в байтах
     const xrayRunning = status && status.xray && status.xray.state === 'running';
     const xrayVer = status && status.xray ? status.xray.version : '';
     const memCur = status && status.mem ? status.mem.current : 0;
     const memTot = status && status.mem ? status.mem.total : 0;
 
+    let panelClients = 0;
+    try {
+      panelClients = (await api.getPanelClients()).length;
+    } catch (e) {
+      panelClients = users.length;
+    }
+
     const mode = api.getApiMode();
     const quotaNote = mode === 'clients'
       ? 'единая квота на все инбаунды'
-      : 'legacy API: лимит применяется к каждому инбаунду';
+      : 'legacy API: лимит на каждый инбаунд';
+
+    const botInfo = await ctx.telegram.getMe();
 
     await ctx.reply(
-      `📊 Дашборд панели\n\n` +
-      `👥 Всего пользователей: ${users.length}\n` +
+      `📊 ПАНЕЛЬ АДМИНИСТРАТОРА\n\n` +
+      `👥 Через бота: ${users.length}\n` +
       `🟢 Активных: ${activeUsers.length}\n` +
       `🔴 Неактивных: ${users.length - activeUsers.length}\n` +
-      `🌐 Онлайн сейчас: ${online.length}\n` +
+      `🗂 Клиентов в панели: ${panelClients}\n` +
+      `🌐 Онлайн: ${online.length}\n` +
       `📡 Инбаундов: ${inbounds.length}\n` +
-      `🖥 Xray: ${xrayRunning ? '🟢 запущен' : '🔴 остановлен'}${xrayVer ? ' (' + xrayVer + ')' : ''}\n` +
+      `🖥 Xray: ${xrayRunning ? '🟢 запущен' : '🔴 остановлен'}${xrayVer ? ' — ' + xrayVer : ''}\n` +
       `💾 CPU: ${status && typeof status.cpu === 'number' ? status.cpu.toFixed(1) + '%' : 'N/A'}\n` +
       `🧠 RAM: ${memTot ? fmtGB(memCur) + ' из ' + fmtGB(memTot) : 'N/A'}\n` +
       `📦 Панель: ${status && status.panelVersion ? status.panelVersion : 'N/A'}\n` +
-      `🔌 API: ${mode} (${quotaNote})\n\n` +
-      `Команды: /users /enable /disable /broadcast /delete`
+      `🔌 API: ${mode} — ${quotaNote}\n\n` +
+      `👑 КОМАНДЫ АДМИНИСТРАТОРА\n` +
+      `/users — список клиентов с кнопками вкл/выкл\n` +
+      `/enable <tg_id> — включить подписку\n` +
+      `/disable <tg_id> — выключить подписку\n` +
+      `/delete <tg_id> — удалить клиента из панели и базы\n` +
+      `/broadcast <текст> — рассылка всей базе`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback('👥 Пользователи', 'adm:users:0'),
+          Markup.button.callback('🔄 Обновить', 'adm:dashboard'),
+        ],
+        [Markup.button.url('📝 Рассылка', cmdLink(botInfo.username, 'broadcast', 'привет'))],
+      ])
     );
   } catch (e) {
     await ctx.reply(`❌ Ошибка: ${e.message}`);
   }
 }
 
-async function cmdUsers(ctx) {
+/**
+ * /users — показываем ВСЕХ клиентов панели, а не только зарегистрированных ботом.
+ * У каждого — кнопка быстрого включения/выключения.
+ */
+async function buildUsersPage(ctx, page) {
   const cfg = getConfig();
-  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
-    return ctx.reply('⛔ Доступ запрещён.');
+  const botInfo = await ctx.telegram.getMe();
+
+  let clients = [];
+  try {
+    clients = await api.getPanelClients();
+  } catch (e) {
+    return ctx.reply(`❌ Не удалось получить клиентов из панели: ${e.message}`);
   }
 
-  const users = await db.getAllUsers();
-  if (users.length === 0) {
-    return ctx.reply('👥 Пользователей пока нет.');
-  }
+  const botUsers = await db.getAllUsers();
+  const byEmail = new Map(botUsers.map(u => [u.email, u]));
 
-  let msg = `👥 Список пользователей (${users.length}):\n\n`;
-  for (const u of users) {
-    const status = u.is_active ? '🟢' : '🔴';
-    const name = u.tg_first_name || u.tg_username || 'без имени';
-    let used = '';
-    try {
-      const t = await api.getClientTraffic(u.email);
-      if (t) used = ` — ${fmtGB((t.up || 0) + (t.down || 0))} из ${fmtGB(u.traffic_limit || 0)}`;
-    } catch (e) {
-      // у пользователя мог отсутствовать клиент — показываем без трафика
+  // Свои (из базы бота) — на первой странице, затем остальные клиенты панели
+  const own = clients.filter(c => byEmail.has(c.email));
+  const foreign = clients.filter(c => !byEmail.has(c.email));
+  const sorted = [...own, ...foreign];
+
+  if (!sorted.length) return ctx.reply('👥 В панели нет клиентов.');
+
+  const pages = Math.ceil(sorted.length / PAGE_SIZE);
+  const cur = Math.max(0, Math.min(page, pages - 1));
+  const slice = sorted.slice(cur * PAGE_SIZE, cur * PAGE_SIZE + PAGE_SIZE);
+
+  let msg = `👥 Клиенты панели: ${sorted.length}\n` +
+    `🗂 Через бота: ${own.length} · ➕ Заведены вручную: ${foreign.length}\n` +
+    `Страница ${cur + 1} из ${pages}\n\n`;
+
+  const rows = [];
+  for (const c of slice) {
+    const bu = byEmail.get(c.email);
+    const used = (c.up || 0) + (c.down || 0);
+    const mark = bu ? (bu.is_active ? '🟢' : '🔴') : '⚪';
+    const who = bu
+      ? `${bu.tg_id} · ${bu.tg_first_name || bu.tg_username || 'без имени'}`
+      : `${c.tgId || 'без TG'} · вручную`;
+    msg += `${mark} ${c.email}\n   ${who}\n   ${fmtGB(used)} из ${fmtGB(c.total || 0)} ${c.enable ? '· 🟢 вкл' : '· 🔴 выкл'}\n\n`;
+
+    // Кнопки include только там, где callback_data влезает в лимит Telegram (64 байта)
+    const emailBuf = Buffer.byteLength(c.email, 'utf8');
+    if (emailBuf <= 55) {
+      rows.push([
+        Markup.button.callback(c.enable ? '⏸ Выключить' : '▶️ Включить', `adm:tgl:${c.enable ? 'off' : 'on'}:${c.email}`),
+        Markup.button.url('🗑 Удалить', cmdLink(botInfo.username, 'delete', bu ? bu.tg_id : c.email)),
+      ]);
     }
-    msg += `${status} ${u.tg_id} — ${name} (@${u.tg_username || 'нет'})${used}\n`;
   }
 
-  await ctx.reply(msg);
+  const nav = [];
+  if (cur > 0) nav.push(Markup.button.callback('◀️ Назад', `adm:users:${cur - 1}`));
+  nav.push(Markup.button.callback('👑 Дашборд', 'adm:dashboard'));
+  if (cur < pages - 1) nav.push(Markup.button.callback('Вперёд ▶️', `adm:users:${cur + 1}`));
+  rows.push(nav);
+
+  return ctx.reply(msg, Markup.inlineKeyboard(rows));
+}
+
+async function cmdUsers(ctx) {
+  if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
+  return buildUsersPage(ctx, 0);
+}
+
+/** Общая логика вкл/выкл — используется и командами, и кнопками. */
+async function toggleClient(ctx, email, enable) {
+  const bu = (await db.getAllUsers()).find(u => u.email === email);
+
+  await api.setClientActive(email, enable);
+  if (bu) await db.setActive(bu.tg_id, enable);
+
+  if (enable) {
+    try {
+      await ctx.telegram.sendMessage(
+        email.replace(/^tg_/, ''),
+        '🎉 Ваша подписка активирована! Нажмите «Подписка», чтобы получить ссылку.'
+      );
+    } catch (e) {
+      // пользователь мог заблокировать бота
+    }
+  }
+  return bu;
+}
+
+async function onAdminCallback(ctx) {
+  if (!isAdmin(ctx)) {
+    await ctx.answerCbQuery('⛔ Нет доступа');
+    return;
+  }
+  const data = (ctx.callbackQuery && ctx.callbackQuery.data) || '';
+
+  if (data === 'adm:dashboard') {
+    await ctx.answerCbQuery();
+    return cmdDashboard(ctx);
+  }
+
+  const usersMatch = data.match(/^adm:users:(\d+)$/);
+  if (usersMatch) {
+    await ctx.answerCbQuery();
+    return buildUsersPage(ctx, parseInt(usersMatch[1], 10));
+  }
+
+  const toggleMatch = data.match(/^adm:tgl:(on|off):(.+)$/);
+  if (toggleMatch) {
+    const email = toggleMatch[2];
+    const enable = toggleMatch[1] === 'on';
+    try {
+      await toggleClient(ctx, email, enable);
+      await ctx.answerCbQuery(enable ? '✅ Включён' : '⏸ Выключен');
+      return buildUsersPage(ctx, 0);
+    } catch (e) {
+      await ctx.answerCbQuery('❌ ' + e.message, { show_alert: true });
+      return;
+    }
+  }
+
+  return ctx.answerCbQuery();
 }
 
 async function cmdEnable(ctx) {
-  const cfg = getConfig();
-  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
-    return ctx.reply('⛔ Доступ запрещён.');
-  }
+  if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
 
-  const text = ctx.message.text;
-  const parts = text.split(' ');
-  const targetId = parseInt(parts[1]);
+  const arg = (ctx.message.text || '').split(' ')[1];
+  if (!arg) return ctx.reply('Использование: /enable <tg_id>');
 
-  if (!targetId) {
-    return ctx.reply('Использование: /enable <tg_id>');
-  }
-
-  const user = await db.getUserByTgId(targetId);
-  if (!user) {
-    return ctx.reply(`❌ Пользователь ${targetId} не найден.`);
-  }
+  let user = await db.getUserByTgId(parseInt(arg, 10));
+  const email = user ? user.email : arg;
 
   try {
-    await api.setClientActive(user.email, true);
-    await db.setActive(targetId, true);
-    await ctx.reply(`✅ Пользователь ${targetId} активирован.`);
-
-    // Notify user
-    try {
-      await ctx.telegram.sendMessage(targetId, '🎉 Ваша подписка активирована! Используйте /my_sub для получения ссылки.');
-    } catch (e) {
-      // user may have blocked bot
-    }
+    await toggleClient(ctx, email, true);
+    await ctx.reply(`✅ ${email} активирован.`);
   } catch (e) {
     await ctx.reply(`❌ Ошибка: ${e.message}`);
   }
 }
 
 async function cmdDisable(ctx) {
-  const cfg = getConfig();
-  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
-    return ctx.reply('⛔ Доступ запрещён.');
-  }
+  if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
 
-  const text = ctx.message.text;
-  const parts = text.split(' ');
-  const targetId = parseInt(parts[1]);
+  const arg = (ctx.message.text || '').split(' ')[1];
+  if (!arg) return ctx.reply('Использование: /disable <tg_id>');
 
-  if (!targetId) {
-    return ctx.reply('Использование: /disable <tg_id>');
-  }
-
-  const user = await db.getUserByTgId(targetId);
-  if (!user) {
-    return ctx.reply(`❌ Пользователь ${targetId} не найден.`);
-  }
+  const user = await db.getUserByTgId(parseInt(arg, 10));
+  const email = user ? user.email : arg;
 
   try {
-    await api.setClientActive(user.email, false);
-    await db.setActive(targetId, false);
-    await ctx.reply(`🔴 Пользователь ${targetId} деактивирован.`);
+    await toggleClient(ctx, email, false);
+    await ctx.reply(`🔴 ${email} деактивирован.`);
   } catch (e) {
     await ctx.reply(`❌ Ошибка: ${e.message}`);
   }
 }
 
 async function cmdBroadcast(ctx) {
-  const cfg = getConfig();
-  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
-    return ctx.reply('⛔ Доступ запрещён.');
-  }
+  if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
 
-  const text = ctx.message.text;
+  const text = ctx.message.text || '';
   const message = text.substring(text.indexOf(' ') + 1);
-
   if (!message || message === text) {
     return ctx.reply('Использование: /broadcast <сообщение>');
   }
@@ -853,34 +1215,32 @@ async function cmdBroadcast(ctx) {
 }
 
 async function cmdDelete(ctx) {
-  const cfg = getConfig();
-  if (String(ctx.from.id) !== String(cfg.admin_tg_id)) {
-    return ctx.reply('⛔ Доступ запрещён.');
-  }
+  if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
 
-  const text = ctx.message.text;
-  const parts = text.split(' ');
-  const targetId = parseInt(parts[1]);
+  const arg = (ctx.message.text || '').split(' ')[1];
+  if (!arg) return ctx.reply('Использование: /delete <tg_id>');
 
-  if (!targetId) {
-    return ctx.reply('Использование: /delete <tg_id>');
-  }
-
-  const user = await db.getUserByTgId(targetId);
-  if (!user) {
-    return ctx.reply(`❌ Пользователь ${targetId} не найден.`);
-  }
+  const user = await db.getUserByTgId(parseInt(arg, 10));
+  const email = user ? user.email : arg;
 
   try {
-    await api.deleteClient(user.email);
-    await db.deleteUser(targetId);
-    await ctx.reply(`🗑 Пользователь ${targetId} удалён.`);
+    await api.deleteClient(email);
+    if (user) await db.deleteUser(user.tg_id);
+    await ctx.reply(`🗑 ${email} удалён из панели и базы.`);
   } catch (e) {
     await ctx.reply(`❌ Ошибка: ${e.message}`);
   }
 }
 
-module.exports = { cmdDashboard, cmdUsers, cmdEnable, cmdDisable, cmdBroadcast, cmdDelete };
+module.exports = {
+  cmdDashboard,
+  cmdUsers,
+  cmdEnable,
+  cmdDisable,
+  cmdBroadcast,
+  cmdDelete,
+  onAdminCallback,
+};
 EOF
 
 # src/index.js
@@ -921,6 +1281,12 @@ async function main() {
   bot.command('disable', adminHandlers.cmdDisable);
   bot.command('broadcast', adminHandlers.cmdBroadcast);
   bot.command('delete', adminHandlers.cmdDelete);
+
+  // Inline-кнопки
+  bot.action(/^grp:check$/, userHandlers.onGroupCheck);
+  bot.action(/^sub:qr$/, userHandlers.onQrButton);
+  bot.action(/^menu:.+$/, userHandlers.onMenuCallback);
+  bot.action(/^adm:.+$/, adminHandlers.onAdminCallback);
 
   // Error handling
   bot.catch((err, ctx) => {

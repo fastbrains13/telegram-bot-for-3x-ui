@@ -11,6 +11,9 @@ function loadConfig() {
     throw new Error('Config file not found. Run installer first.');
   }
   config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  // Значения по умолчанию для полей, добавленных после установки
+  if (config.sub_path === undefined) config.sub_path = '/sub';
+  if (config.group_link === undefined) config.group_link = '';
   return config;
 }
 

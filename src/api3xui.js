@@ -243,23 +243,85 @@ async function getClientTraffic(email) {
   return res.obj;
 }
 
-/** Панель сама подставляет корректные хост/порт из своих настроек. */
+/**
+ * Ссылка именно на ПОДПИСКУ (sub), а не на конфигурацию.
+ * Эндпоинт /clients/subLinks отдаёт готовые конфиги (vless://, trojan://),
+ * поэтому ссылка собирается вручную из настроек панели: {panel_url}{sub_path}/{subId}.
+ */
 async function getSubscriptionUrl(subId) {
+  const cfg = getConfig();
+  const subPath = (cfg.sub_path || '/sub').replace(/\/+$/, '');
+  return `${cfg.panel_url.replace(/\/$/, '')}${subPath}/${subId}`;
+}
+
+/**
+ * Все клиенты панели (не только зарегистрированные ботом).
+ * В clients-режиме /clients/list отдаёт сразу всех; в legacy клиенты
+ * лежат внутри settings каждого инбаунда.
+ */
+async function getPanelClients() {
   if (apiMode === 'clients') {
+    const res = await apiRequest('/panel/api/clients/list');
+    const rows = Array.isArray(res.obj) ? res.obj : [];
+    return rows.map(c => ({
+      email: c.email,
+      subId: c.subId || '',
+      uuid: c.uuid || c.id || '',
+      tgId: c.tgId || 0,
+      enable: !!c.enable,
+      total: c.totalGB || (c.traffic && c.traffic.total) || 0,
+      up: (c.traffic && c.traffic.up) || 0,
+      down: (c.traffic && c.traffic.down) || 0,
+      expiryTime: c.expiryTime || 0,
+      comment: c.comment || '',
+      online: false,
+    }));
+  }
+
+  const inbounds = await getInbounds();
+  const byEmail = new Map();
+  for (const inbound of inbounds) {
+    let settings;
     try {
-      const res = await apiRequest(`/panel/api/clients/subLinks/${encodeURIComponent(subId)}`);
-      if (Array.isArray(res.obj) && res.obj.length) {
-        const first = res.obj[0];
-        const url = typeof first === 'string' ? first : (first && first.url);
-        if (url) return url;
-      }
+      settings = JSON.parse(inbound.settings || '{}');
     } catch (e) {
-      /* эндпоинт недоступен — собираем ссылку вручную */
+      continue;
+    }
+    for (const c of settings.clients || []) {
+      if (!c.email) continue;
+      if (!byEmail.has(c.email)) {
+        byEmail.set(c.email, {
+          email: c.email,
+          subId: c.subId || '',
+          uuid: c.id || c.password || '',
+          tgId: Number(c.tgId) || 0,
+          enable: !!c.enable,
+          total: c.totalGB || 0,
+          up: 0,
+          down: 0,
+          expiryTime: c.expiryTime || 0,
+          comment: c.comment || '',
+          online: false,
+        });
+      }
     }
   }
-  const cfg = getConfig();
-  const subPath = cfg.sub_path || '/sub';
-  return `${cfg.panel_url.replace(/\/$/, '')}${subPath}/${subId}`;
+
+  // В 2.x трафик хранится отдельной строкой на email — он и даёт общую картину
+  for (const [email, c] of byEmail) {
+    try {
+      const t = await getClientTraffic(email);
+      if (t) {
+        c.up = t.up || 0;
+        c.down = t.down || 0;
+        c.enable = t.enable !== undefined ? !!t.enable : c.enable;
+        if (t.total) c.total = t.total;
+      }
+    } catch (e) {
+      /* статистики ещё нет */
+    }
+  }
+  return [...byEmail.values()];
 }
 
 module.exports = {
@@ -269,6 +331,7 @@ module.exports = {
   getServerStatus,
   getOnlineCount,
   getClientTraffic,
+  getPanelClients,
   registerUser,
   getClient,
   getNewUUID,

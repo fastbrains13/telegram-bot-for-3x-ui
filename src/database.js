@@ -25,13 +25,26 @@ async function getDb() {
       registered_at INTEGER NOT NULL,
       is_active INTEGER DEFAULT 0,
       traffic_limit INTEGER DEFAULT 107374182400,
-      used_traffic INTEGER DEFAULT 0
+      used_traffic INTEGER DEFAULT 0,
+      group_joined INTEGER DEFAULT 0,
+      group_invite_link TEXT
     );
     CREATE TABLE IF NOT EXISTS admin_settings (
       key TEXT PRIMARY KEY,
       value TEXT
     );
   `);
+  // Миграция для баз, созданных до появления обязательной привязки к группе
+  const cols = db.exec('PRAGMA table_info(users)');
+  const names = cols.length ? cols[0].values.map(v => v[1]) : [];
+  if (!names.includes('group_joined')) {
+    db.run('ALTER TABLE users ADD COLUMN group_joined INTEGER DEFAULT 0');
+    saveDb();
+  }
+  if (!names.includes('group_invite_link')) {
+    db.run('ALTER TABLE users ADD COLUMN group_invite_link TEXT');
+    saveDb();
+  }
   return db;
 }
 
@@ -79,6 +92,16 @@ async function setActive(tgId, isActive) {
   saveDb();
 }
 
+async function setGroupJoined(tgId, joined, inviteLink) {
+  const d = await getDb();
+  const link = inviteLink ? `'${String(inviteLink).replace(/'/g, "''")}'` : 'NULL';
+  d.run(
+    'UPDATE users SET group_joined = ' + (joined ? 1 : 0) + ', group_invite_link = ' + link +
+    ' WHERE tg_id = ' + Number(tgId)
+  );
+  saveDb();
+}
+
 async function deleteUser(tgId) {
   const d = await getDb();
   d.run('DELETE FROM users WHERE tg_id = ' + Number(tgId));
@@ -92,5 +115,6 @@ module.exports = {
   getUserByTgId,
   getAllUsers,
   setActive,
+  setGroupJoined,
   deleteUser,
 };

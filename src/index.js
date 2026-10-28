@@ -35,6 +35,12 @@ async function main() {
   bot.command('broadcast', adminHandlers.cmdBroadcast);
   bot.command('delete', adminHandlers.cmdDelete);
 
+  // Inline-кнопки
+  bot.action(/^grp:check$/, userHandlers.onGroupCheck);
+  bot.action(/^sub:qr$/, userHandlers.onQrButton);
+  bot.action(/^menu:.+$/, userHandlers.onMenuCallback);
+  bot.action(/^adm:.+$/, adminHandlers.onAdminCallback);
+
   // Error handling
   bot.catch((err, ctx) => {
     console.error('Bot error:', err);
