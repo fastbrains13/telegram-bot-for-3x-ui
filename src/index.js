@@ -2,6 +2,7 @@ const { Telegraf } = require('telegraf');
 const { getConfig } = require('./config');
 const db = require('./database');
 const api = require('./api3xui');
+const sync = require('./sync');
 const userHandlers = require('./handlers/user');
 const adminHandlers = require('./handlers/admin');
 
@@ -16,7 +17,7 @@ async function main() {
   // Set bot commands
   await bot.telegram.setMyCommands([
     { command: 'start', description: 'Регистрация' },
-    { command: 'my_sub', description: 'Моя подписка' },
+    { command: 'sub', description: 'Моя подписка' },
     { command: 'stats', description: 'Статистика' },
     { command: 'help', description: 'Помощь' },
   ]);
@@ -24,6 +25,7 @@ async function main() {
   // User commands
   bot.start(userHandlers.cmdStart);
   bot.command('my_sub', userHandlers.cmdMySub);
+  bot.command('sub', userHandlers.cmdMySub);
   bot.command('stats', userHandlers.cmdStats);
   bot.command('help', userHandlers.cmdHelp);
 
@@ -61,6 +63,11 @@ async function main() {
     if (launchOpts.domain) {
       console.log(`   Webhook: https://${launchOpts.domain}:${launchOpts.port}`);
     }
+    // Первичная синхронизация и периодический опрос панели
+    sync.syncOnce(bot.telegram)
+      .then(r => console.log(`🔄 Синхронизировано клиентов: ${r.total} (новых: ${r.newlySeen})`))
+      .catch(e => console.error('Первичная синхронизация не удалась:', e.message));
+    sync.startSyncLoop(bot.telegram);
   });
 
   // Graceful shutdown

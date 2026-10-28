@@ -14,6 +14,12 @@ function loadConfig() {
   // Значения по умолчанию для полей, добавленных после установки
   if (config.sub_path === undefined) config.sub_path = '/sub';
   if (config.group_link === undefined) config.group_link = '';
+  // Имя группы клиентов в панели (поле group) — куда попадают новые клиенты
+  if (config.panel_client_group === undefined) config.panel_client_group = 'Telegram';
+  // Уведомлять администратора о новых клиентах в панели
+  if (config.notify_new_clients === undefined) config.notify_new_clients = true;
+  // Период опроса панели в секундах
+  if (config.sync_interval_sec === undefined) config.sync_interval_sec = 60;
   return config;
 }
 

@@ -115,6 +115,42 @@ async function getServerStatus() {
   return res.obj;
 }
 
+/**
+ * Настройки панели: POST /panel/api/setting/all.
+ * Нужны, чтобы взять subURI — базовый адрес подписки. У подписки отдельный
+ * порт (subPort), отдельный путь (subPath) и, возможно, отдельный домен,
+ * поэтому ссылка подписки НЕ равна panel_url + /sub.
+ */
+let subBaseCache = '';
+async function getSubscriptionBase() {
+  if (subBaseCache) return subBaseCache;
+  const cfg = getConfig();
+  try {
+    const res = await apiRequest('/panel/api/setting/all', 'POST', {});
+    const s = res.obj || {};
+    let base = String(s.subURI || '').trim();
+    if (!base && s.subEnable) {
+      const domain = s.subDomain ||
+        cfg.panel_url.replace(/^https?:\/\//, '').replace(/:\d+$/, '').replace(/\/$/, '');
+      const subPath = String(s.subPath || '/sub/');
+      const tls = !!(s.subCertFile && s.subKeyFile);
+      const scheme = tls ? 'https' : (String(cfg.panel_url).startsWith('https') ? 'https' : 'http');
+      const port = Number(s.subPort) || 0;
+      const hostPort = (port && port !== 80 && port !== 443) ? `${domain}:${port}` : domain;
+      base = `${scheme}://${hostPort}${subPath}`;
+    }
+    if (base) {
+      if (!base.endsWith('/')) base += '/';
+      subBaseCache = base;
+      return base;
+    }
+  } catch (e) {
+    /* нет доступа к настройкам — собираем из panel_url */
+  }
+  const subPath = (cfg.sub_path || '/sub').replace(/\/+$/, '');
+  return `${cfg.panel_url.replace(/\/$/, '')}${subPath}/`;
+}
+
 async function getOnlineCount() {
   if (apiMode === 'clients') {
     const res = await apiRequest('/panel/api/clients/onlines', 'POST', {});
@@ -134,6 +170,8 @@ async function getOnlineCount() {
  */
 async function registerUser({ email, subId, tgId, inboundIds }) {
   const total = trafficBytes();
+  // Имя группы клиентов в панели (поле group) — например "Telegram"
+  const groupName = String(getConfig().panel_client_group || '').trim();
 
   if (apiMode === 'clients') {
     const res = await apiRequest('/panel/api/clients/add', 'POST', {
@@ -146,6 +184,7 @@ async function registerUser({ email, subId, tgId, inboundIds }) {
         expiryTime: 0,
         limitIp: 0,
         reset: 0,
+        group: groupName,
       },
       inboundIds,
     });
@@ -172,6 +211,7 @@ async function registerUser({ email, subId, tgId, inboundIds }) {
       expiryTime: 0,
       tgId: Number(tgId) || 0,
       reset: 0,
+      group: groupName,
     };
     // Панель требует свой credential под каждый протокол
     if (inbound.protocol === 'trojan' || inbound.protocol === 'shadowsocks') {
@@ -246,12 +286,12 @@ async function getClientTraffic(email) {
 /**
  * Ссылка именно на ПОДПИСКУ (sub), а не на конфигурацию.
  * Эндпоинт /clients/subLinks отдаёт готовые конфиги (vless://, trojan://),
- * поэтому ссылка собирается вручную из настроек панели: {panel_url}{sub_path}/{subId}.
+ * поэтому ссылка собирается из subURI панели: {subURI}{subId}.
+ * subURI учитывает отдельный порт/домен/путь подписки из настроек панели.
  */
 async function getSubscriptionUrl(subId) {
-  const cfg = getConfig();
-  const subPath = (cfg.sub_path || '/sub').replace(/\/+$/, '');
-  return `${cfg.panel_url.replace(/\/$/, '')}${subPath}/${subId}`;
+  const base = await getSubscriptionBase();
+  return `${base}${subId}`;
 }
 
 /**
@@ -268,12 +308,13 @@ async function getPanelClients() {
       subId: c.subId || '',
       uuid: c.uuid || c.id || '',
       tgId: c.tgId || 0,
-      enable: !!c.enable,
+      enable: !!(c.traffic ? c.traffic.enable : c.enable),
       total: c.totalGB || (c.traffic && c.traffic.total) || 0,
       up: (c.traffic && c.traffic.up) || 0,
       down: (c.traffic && c.traffic.down) || 0,
       expiryTime: c.expiryTime || 0,
       comment: c.comment || '',
+      group: c.group || '',
       online: false,
     }));
   }
@@ -324,6 +365,39 @@ async function getPanelClients() {
   return [...byEmail.values()];
 }
 
+/**
+ * Клиент панели, заведённый вручную, но привязанный к Telegram-аккаунту.
+ * Позволяет пользоваться ботом без /start.
+ */
+async function getClientByTgId(tgId) {
+  const id = Number(tgId);
+  if (!id) return null;
+
+  if (apiMode === 'clients') {
+    try {
+      const res = await apiRequest(`/panel/api/clients/get/tgId/${id}`);
+      const rec = res.obj;
+      const c = rec && (rec.client || rec);
+      if (c && c.email) {
+        return {
+          email: c.email,
+          subId: c.subId || '',
+          uuid: c.uuid || c.id || '',
+          tgId: id,
+          enable: !!c.enable,
+          total: c.totalGB || 0,
+          group: c.group || '',
+        };
+      }
+    } catch (e) {
+      /* эндпоинт недоступен — ищем перебором */
+    }
+  }
+
+  const all = await getPanelClients();
+  return all.find(c => Number(c.tgId) === id) || null;
+}
+
 module.exports = {
   login,
   getApiMode,
@@ -332,11 +406,13 @@ module.exports = {
   getOnlineCount,
   getClientTraffic,
   getPanelClients,
+  getClientByTgId,
   registerUser,
   getClient,
   getNewUUID,
   setClientActive,
   deleteClient,
   getSubscriptionUrl,
+  getSubscriptionBase,
   trafficBytes,
 };

@@ -181,14 +181,30 @@ async function sendSubLink(ctx, user) {
   );
 }
 
-async function cmdMySub(ctx) {
+/**
+ * Находит пользователя: сначала в базе бота, затем среди клиентов панели
+ * (на случай, когда админ завёл клиента вручную и указал его tgId).
+ */
+async function findUser(ctx) {
   const user = await db.getUserByTgId(ctx.from.id);
+  if (user) return user;
+  const pc = await api.getClientByTgId(ctx.from.id).catch(() => null);
+  if (!pc || !pc.email) return null;
+  return db.importPanelClient({
+    tgId: ctx.from.id, email: pc.email, subId: pc.subId, uuid: pc.uuid, trafficLimit: pc.total,
+  });
+}
+
+async function cmdMySub(ctx) {
+  const cfg = getConfig();
+  const user = await findUser(ctx);
+
   if (!user) {
     return ctx.reply('❌ Вы не зарегистрированы. Нажмите /start для регистрации.');
   }
 
   // Подписка доступна только привязанным к группе
-  if (getConfig().tg_group_id && !user.group_joined) {
+  if (cfg.tg_group_id && !user.group_joined) {
     const rows = [];
     if (user.group_invite_link) {
       rows.push([Markup.button.url('👥 Вступить в группу', user.group_invite_link)]);
@@ -197,11 +213,33 @@ async function cmdMySub(ctx) {
     return ctx.reply('⛔ Подписка доступна только после вступления в нашу Telegram-группу.', Markup.inlineKeyboard(rows));
   }
 
-  if (!user.is_active) {
-    return ctx.reply('⏸ Ваша подписка ещё не активирована администратором.', mainKeyboard(ctx, getConfig()));
+  // Панель — источник истины о статусе: клиента могли включить прямо в ней
+  const fresh = await refreshStatus(user);
+  if (!fresh.is_active) {
+    return ctx.reply('⏸ Ваша подписка ещё не активирована администратором.', mainKeyboard(ctx, cfg));
   }
 
-  return sendSubLink(ctx, user);
+  return sendSubLink(ctx, fresh);
+}
+
+/**
+ * Сверяет локальный флаг is_active с реальным состоянием клиента в панели.
+ * Позволяет включать и выключать подписки прямо в 3x-ui без рассинхрона в боте.
+ */
+async function refreshStatus(user) {
+  try {
+    const t = await api.getClientTraffic(user.email);
+    if (t && t.enable !== undefined) {
+      const active = t.enable ? 1 : 0;
+      if (Number(user.is_active) !== active) {
+        await db.setActive(user.tg_id, !!active);
+        user.is_active = active;
+      }
+    }
+  } catch (e) {
+    /* панель недоступна — оставляем локальный флаг */
+  }
+  return user;
 }
 
 /** QR отправляем отдельным сообщением — по нажатию кнопки. */
@@ -221,11 +259,12 @@ async function onQrButton(ctx) {
   if (getConfig().tg_group_id && !user.group_joined) {
     return ctx.answerCbQuery('⛔ Сначала вступите в группу', { show_alert: true });
   }
-  if (!user.is_active) {
+  const fresh = await refreshStatus(user);
+  if (!fresh.is_active) {
     return ctx.answerCbQuery('⏸ Подписка ещё не активирована', { show_alert: true });
   }
   await ctx.answerCbQuery('Готовлю QR…');
-  return sendQr(ctx, user);
+  return sendQr(ctx, fresh);
 }
 
 async function sendStats(ctx, user) {
@@ -259,11 +298,11 @@ async function sendStats(ctx, user) {
 }
 
 async function cmdStats(ctx) {
-  const user = await db.getUserByTgId(ctx.from.id);
+  const user = await findUser(ctx);
   if (!user) {
     return ctx.reply('❌ Вы не зарегистрированы. Нажмите /start для регистрации.');
   }
-  return sendStats(ctx, user);
+  return sendStats(ctx, await refreshStatus(user));
 }
 
 async function cmdHelp(ctx) {
@@ -314,6 +353,7 @@ module.exports = {
   cmdStats,
   cmdHelp,
   sendQr,
+  findUser,
   mainKeyboard,
   onGroupCheck,
   onQrButton,

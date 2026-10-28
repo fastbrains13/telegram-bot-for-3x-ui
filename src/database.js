@@ -33,6 +33,18 @@ async function getDb() {
       key TEXT PRIMARY KEY,
       value TEXT
     );
+    CREATE TABLE IF NOT EXISTS panel_clients (
+      email TEXT PRIMARY KEY,
+      sub_id TEXT,
+      tg_id INTEGER DEFAULT 0,
+      enable INTEGER DEFAULT 0,
+      total INTEGER DEFAULT 0,
+      up INTEGER DEFAULT 0,
+      down INTEGER DEFAULT 0,
+      group_name TEXT,
+      first_seen INTEGER,
+      notified INTEGER DEFAULT 0
+    );
   `);
   // Миграция для баз, созданных до появления обязательной привязки к группе
   const cols = db.exec('PRAGMA table_info(users)');
@@ -108,13 +120,99 @@ async function deleteUser(tgId) {
   saveDb();
 }
 
+function sqlStr(v) {
+  return `'${String(v === null || v === undefined ? '' : v).replace(/'/g, "''")}'`;
+}
+
+/**
+ * Заносит/обновляет снимок клиента панели и возвращает разницу:
+ * newlySeen — клиенты, которых в этой таблице раньше не было (уведомить админа),
+ * enabled   — клиенты, у которых панель сообщила enable=true.
+ */
+async function syncPanelClients(clients) {
+  const d = await getDb();
+  const res = d.exec('SELECT email, enable, notified FROM panel_clients');
+  const known = new Map();
+  if (res.length) {
+    for (const row of res[0].values) known.set(row[0], { enable: row[1], notified: row[2] });
+  }
+
+  const newlySeen = [];
+  const enabled = [];
+
+  for (const c of clients) {
+    if (!c.email) continue;
+    const prev = known.get(c.email);
+    const enable = c.enable ? 1 : 0;
+    d.run(
+      'INSERT INTO panel_clients (email, sub_id, tg_id, enable, total, up, down, group_name, first_seen, notified) ' +
+      'VALUES (' + [
+        sqlStr(c.email), sqlStr(c.subId), Number(c.tgId) || 0, enable,
+        Number(c.total) || 0, Number(c.up) || 0, Number(c.down) || 0,
+        sqlStr(c.group), Date.now(), prev ? prev.notified : 0,
+      ].join(', ') + ') ' +
+      'ON CONFLICT(email) DO UPDATE SET sub_id=excluded.sub_id, tg_id=excluded.tg_id, enable=excluded.enable, ' +
+      'total=excluded.total, up=excluded.up, down=excluded.down, group_name=excluded.group_name'
+    );
+    if (!prev) newlySeen.push(c);
+    else if (!prev.enable && enable) enabled.push(c);
+  }
+
+  // Клиенты, удалённые из панели, убираем из снимка
+  const live = new Set(clients.map(c => c.email));
+  for (const email of known.keys()) {
+    if (!live.has(email)) d.run('DELETE FROM panel_clients WHERE email = ' + sqlStr(email));
+  }
+
+  saveDb();
+  return { newlySeen, enabled };
+}
+
+/** Отметить, что админ уже уведомлён о клиенте. */
+async function markPanelClientNotified(email) {
+  const d = await getDb();
+  d.run('UPDATE panel_clients SET notified = 1 WHERE email = ' + sqlStr(email));
+  saveDb();
+}
+
+async function getUserByEmail(email) {
+  const d = await getDb();
+  const res = d.exec('SELECT * FROM users WHERE email = ' + sqlStr(email));
+  if (!res.length || !res[0].values.length) return null;
+  return rowToObj(res[0].columns, res[0].values[0]);
+}
+
+/** Импорт клиента, заведённого вручную в панели (для /my_sub без /start). */
+async function importPanelClient({ tgId, email, subId, uuid, trafficLimit }) {
+  const d = await getDb();
+  const exists = await getUserByTgId(tgId);
+  if (exists) return exists;
+  await registerUser({
+    tgId,
+    username: '',
+    firstName: '',
+    email,
+    uuid: uuid || '',
+    subId,
+    trafficLimit,
+  });
+  // Клиент создан админом — требование группы к нему не применяется
+  d.run('UPDATE users SET group_joined = 1 WHERE tg_id = ' + Number(tgId));
+  saveDb();
+  return getUserByTgId(tgId);
+}
+
 module.exports = {
   getDb,
   saveDb,
   registerUser,
   getUserByTgId,
+  getUserByEmail,
   getAllUsers,
   setActive,
   setGroupJoined,
   deleteUser,
+  syncPanelClients,
+  markPanelClientNotified,
+  importPanelClient,
 };
