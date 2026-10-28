@@ -262,7 +262,8 @@ async function login() {
   }
 
   const baseUrl = cfg.panel_url.replace(/\/$/, '');
-  const loginPath = cfg.panel_base_path ? `${cfg.panel_base_path}/login` : '/login';
+  const base = cfg.panel_base_path ? cfg.panel_base_path.replace(/^\//, '') : '';
+  const loginPath = base ? `/${base}/login` : '/login';
   const res = await request(`${baseUrl}${loginPath}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -272,7 +273,16 @@ async function login() {
   const setCookie = res.headers['set-cookie'];
   if (setCookie) cookies = setCookie.map(c => c.split(';')[0]).join('; ');
 
-  const json = await res.body.json().catch(() => ({}));
+  const text = await res.body.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    throw new Error(
+      `Логин панели не вернул JSON (HTTP ${res.statusCode} по адресу ${loginPath}). ` +
+      `Проверьте panel_url и panel_base_path в data/config.json.`
+    );
+  }
   if (json.success === false) throw new Error('Panel login failed: ' + (json.msg || 'unknown'));
   apiMode = await probeClientsApi();
 }
@@ -292,6 +302,8 @@ async function probeClientsApi() {
 async function apiRequest(path, method = 'GET', body = null, allowRetry = true) {
   const cfg = getConfig();
   const baseUrl = cfg.panel_url.replace(/\/$/, '');
+  const base = cfg.panel_base_path ? cfg.panel_base_path.replace(/^\//, '') : '';
+  const full = base ? `/${base}${path}` : path;
   const headers = {};
   if (cfg.api_token) headers['Authorization'] = `Bearer ${cfg.api_token}`;
   else if (cookies) headers['Cookie'] = cookies;
@@ -302,7 +314,7 @@ async function apiRequest(path, method = 'GET', body = null, allowRetry = true) 
     opts.body = JSON.stringify(body);
   }
 
-  const res = await request(`${baseUrl}${path}`, opts);
+  const res = await request(`${baseUrl}${full}`, opts);
   const text = await res.body.text();
 
   let json;
@@ -310,6 +322,10 @@ async function apiRequest(path, method = 'GET', body = null, allowRetry = true) 
     json = JSON.parse(text);
   } catch (e) {
     // Пустой ответ addClient — известная особенность ряда версий панели.
+    // Для всех остальных GET-запросов — бросаем понятную ошибку.
+    if (res.statusCode === 404) {
+      throw new Error(`API 404: ${full} (возможно, неверный panel_base_path или панель не запущена)`);
+    }
     return { success: res.statusCode >= 200 && res.statusCode < 300, obj: null, raw: text };
   }
 
@@ -320,7 +336,7 @@ async function apiRequest(path, method = 'GET', body = null, allowRetry = true) 
     return apiRequest(path, method, body, false);
   }
 
-  if (res.statusCode === 404) throw new Error(`Not found: ${path}`);
+  if (res.statusCode === 404) throw new Error(`Not found: ${full}`);
   return json;
 }
 
