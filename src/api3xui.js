@@ -284,6 +284,33 @@ async function getClientTraffic(email) {
 }
 
 /**
+ * Есть ли клиент в панели. Возвращает true/false, либо null, когда ответить
+ * нельзя (панель недоступен, пустой или непонятный ответ) — чтобы бот не
+ * деактивировал подписки из-за сбоя API.
+ */
+async function clientExists(email) {
+  if (apiMode === 'clients') {
+    let res;
+    try {
+      res = await apiRequest(`/panel/api/clients/get/${encodeURIComponent(email)}`);
+    } catch (e) {
+      return null;
+    }
+    if (res && res.obj) return true;
+    if (res && res.success === false) return false;
+    return null;
+  }
+
+  try {
+    const all = await getPanelClients();
+    if (!all.length) return null;
+    return all.some(c => c.email === email);
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
  * Ссылка именно на ПОДПИСКУ (sub), а не на конфигурацию.
  * Эндпоинт /clients/subLinks отдаёт готовые конфиги (vless://, trojan://),
  * поэтому ссылка собирается из subURI панели: {subURI}{subId}.
@@ -342,6 +369,7 @@ async function getPanelClients() {
           down: 0,
           expiryTime: c.expiryTime || 0,
           comment: c.comment || '',
+          group: c.group || '',
           online: false,
         });
       }
@@ -363,6 +391,24 @@ async function getPanelClients() {
     }
   }
   return [...byEmail.values()];
+}
+
+/**
+ * Группы клиентов панели (поле group) с количеством клиентов в каждой.
+ * Используется установщиком и админом, чтобы выбрать группу для новых клиентов.
+ * Пустое значение group показывается как «(без группы)» — такие клиенты в
+ * веб-интерфейсе попадают в раздел без названия.
+ */
+async function getClientGroups() {
+  const clients = await getPanelClients();
+  const byName = new Map();
+  for (const c of clients) {
+    const name = String(c.group || '').trim();
+    byName.set(name, (byName.get(name) || 0) + 1);
+  }
+  return [...byName.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, 'ru'));
 }
 
 /**
@@ -406,12 +452,14 @@ module.exports = {
   getOnlineCount,
   getClientTraffic,
   getPanelClients,
+  getClientGroups,
   getClientByTgId,
   registerUser,
   getClient,
   getNewUUID,
   setClientActive,
   deleteClient,
+  clientExists,
   getSubscriptionUrl,
   getSubscriptionBase,
   trafficBytes,

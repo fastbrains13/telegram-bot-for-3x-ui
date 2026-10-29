@@ -40,6 +40,16 @@ async function syncOnce(telegram) {
       }
     }
 
+    // 1b. Клиента удалили в веб-интерфейсе панели — закрываем доступ и в боте,
+    // иначе /my_sub отдавал бы ссылку на несуществующую подписку.
+    // clientExists === false только при точном ответе панели, сбой API игнорируем.
+    for (const u of await db.getAllUsers()) {
+      if (!Number(u.is_active)) continue;
+      if (await api.clientExists(u.email) !== false) continue;
+      await db.setActive(u.tg_id, false);
+      console.log(`[sync] ${u.email} отсутствует в панели — подписка деактивирована`);
+    }
+
     // 2. Ручные клиенты с указанным tgId начинают пользоваться ботом без /start
     for (const c of newlySeen) {
       const tgId = Number(c.tgId) || 0;

@@ -36,6 +36,7 @@ async function main() {
   bot.command('disable', adminHandlers.cmdDisable);
   bot.command('broadcast', adminHandlers.cmdBroadcast);
   bot.command('delete', adminHandlers.cmdDelete);
+  bot.command('setgroup', adminHandlers.cmdSetGroup);
 
   // Inline-кнопки
   bot.action(/^grp:check$/, userHandlers.onGroupCheck);

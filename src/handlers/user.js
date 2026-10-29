@@ -214,7 +214,14 @@ async function cmdMySub(ctx) {
   }
 
   // Панель — источник истины о статусе: клиента могли включить прямо в ней
+  // или удалить в веб-интерфейсе. refreshStatus обновляет is_active и ставит
+  // флаг panelMissing, если записи о клиенте в панели больше нет.
   const fresh = await refreshStatus(user);
+  if (fresh.panelMissing) {
+    return ctx.reply(
+      '⚠️ Ваша подписка больше не найдена в панели — обратитесь к администратору.'
+    );
+  }
   if (!fresh.is_active) {
     return ctx.reply('⏸ Ваша подписка ещё не активирована администратором.', mainKeyboard(ctx, cfg));
   }
@@ -225,11 +232,22 @@ async function cmdMySub(ctx) {
 /**
  * Сверяет локальный флаг is_active с реальным состоянием клиента в панели.
  * Позволяет включать и выключать подписки прямо в 3x-ui без рассинхрона в боте.
+ * Если записи о клиенте в панели уже нет (удалили в веб-интерфейсе), доступ
+ * закрывается — иначе бот отдавал бы ссылку, которая не работает.
  */
 async function refreshStatus(user) {
   try {
     const t = await api.getClientTraffic(user.email);
-    if (t && t.enable !== undefined) {
+    if (!t) {
+      // Строки трафика ещё нет, но клиент в панели есть — статус не трогаем.
+      // null = панель не ответила определённо, тоже не трогаем.
+      if (await api.clientExists(user.email) !== false) return user;
+      if (Number(user.is_active)) await db.setActive(user.tg_id, false);
+      user.is_active = 0;
+      user.panelMissing = true;
+      return user;
+    }
+    if (t.enable !== undefined) {
       const active = t.enable ? 1 : 0;
       if (Number(user.is_active) !== active) {
         await db.setActive(user.tg_id, !!active);
@@ -260,6 +278,9 @@ async function onQrButton(ctx) {
     return ctx.answerCbQuery('⛔ Сначала вступите в группу', { show_alert: true });
   }
   const fresh = await refreshStatus(user);
+  if (fresh.panelMissing) {
+    return ctx.answerCbQuery('⚠️ Подписка не найдена в панели — напишите администратору', { show_alert: true });
+  }
   if (!fresh.is_active) {
     return ctx.answerCbQuery('⏸ Подписка ещё не активирована', { show_alert: true });
   }
@@ -302,7 +323,11 @@ async function cmdStats(ctx) {
   if (!user) {
     return ctx.reply('❌ Вы не зарегистрированы. Нажмите /start для регистрации.');
   }
-  return sendStats(ctx, await refreshStatus(user));
+  const fresh = await refreshStatus(user);
+  if (fresh.panelMissing) {
+    return ctx.reply('⚠️ Ваша подписка больше не найдена в панели — обратитесь к администратору.');
+  }
+  return sendStats(ctx, fresh);
 }
 
 async function cmdHelp(ctx) {

@@ -60,7 +60,7 @@ read -rp "Лимит трафика по умолчанию, ГБ [100]: " TRAFF
 TRAFFIC_GB=${TRAFFIC_GB:-100}
 read -rp "Путь подписки в панели [sub]: " SUB_PATH
 SUB_PATH=${SUB_PATH:-sub}
-read -rp "Имя группы клиентов в панели 3x-ui [Telegram]: " PANEL_CLIENT_GROUP
+read -rp "Группа клиентов в панели по умолчанию [Telegram]: " PANEL_CLIENT_GROUP
 PANEL_CLIENT_GROUP=${PANEL_CLIENT_GROUP:-Telegram}
 read -rp "Уведомлять админа о новых клиентах в панели? (y/n) [y]: " NOTIFY_NEW
 NOTIFY_NEW=${NOTIFY_NEW:-y}
@@ -678,6 +678,33 @@ async function getClientTraffic(email) {
 }
 
 /**
+ * Есть ли клиент в панели. Возвращает true/false, либо null, когда ответить
+ * нельзя (панель недоступен, пустой или непонятный ответ) — чтобы бот не
+ * деактивировал подписки из-за сбоя API.
+ */
+async function clientExists(email) {
+  if (apiMode === 'clients') {
+    let res;
+    try {
+      res = await apiRequest(`/panel/api/clients/get/${encodeURIComponent(email)}`);
+    } catch (e) {
+      return null;
+    }
+    if (res && res.obj) return true;
+    if (res && res.success === false) return false;
+    return null;
+  }
+
+  try {
+    const all = await getPanelClients();
+    if (!all.length) return null;
+    return all.some(c => c.email === email);
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
  * Ссылка именно на ПОДПИСКУ (sub), а не на конфигурацию.
  * Эндпоинт /clients/subLinks отдаёт готовые конфиги (vless://, trojan://),
  * поэтому ссылка собирается из subURI панели: {subURI}{subId}.
@@ -736,6 +763,7 @@ async function getPanelClients() {
           down: 0,
           expiryTime: c.expiryTime || 0,
           comment: c.comment || '',
+          group: c.group || '',
           online: false,
         });
       }
@@ -757,6 +785,24 @@ async function getPanelClients() {
     }
   }
   return [...byEmail.values()];
+}
+
+/**
+ * Группы клиентов панели (поле group) с количеством клиентов в каждой.
+ * Используется установщиком и админом, чтобы выбрать группу для новых клиентов.
+ * Пустое значение group показывается как «(без группы)» — такие клиенты в
+ * веб-интерфейсе попадают в раздел без названия.
+ */
+async function getClientGroups() {
+  const clients = await getPanelClients();
+  const byName = new Map();
+  for (const c of clients) {
+    const name = String(c.group || '').trim();
+    byName.set(name, (byName.get(name) || 0) + 1);
+  }
+  return [...byName.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, 'ru'));
 }
 
 /**
@@ -800,12 +846,14 @@ module.exports = {
   getOnlineCount,
   getClientTraffic,
   getPanelClients,
+  getClientGroups,
   getClientByTgId,
   registerUser,
   getClient,
   getNewUUID,
   setClientActive,
   deleteClient,
+  clientExists,
   getSubscriptionUrl,
   getSubscriptionBase,
   trafficBytes,
@@ -1030,7 +1078,14 @@ async function cmdMySub(ctx) {
   }
 
   // Панель — источник истины о статусе: клиента могли включить прямо в ней
+  // или удалить в веб-интерфейсе. refreshStatus обновляет is_active и ставит
+  // флаг panelMissing, если записи о клиенте в панели больше нет.
   const fresh = await refreshStatus(user);
+  if (fresh.panelMissing) {
+    return ctx.reply(
+      '⚠️ Ваша подписка больше не найдена в панели — обратитесь к администратору.'
+    );
+  }
   if (!fresh.is_active) {
     return ctx.reply('⏸ Ваша подписка ещё не активирована администратором.', mainKeyboard(ctx, cfg));
   }
@@ -1041,11 +1096,22 @@ async function cmdMySub(ctx) {
 /**
  * Сверяет локальный флаг is_active с реальным состоянием клиента в панели.
  * Позволяет включать и выключать подписки прямо в 3x-ui без рассинхрона в боте.
+ * Если записи о клиенте в панели уже нет (удалили в веб-интерфейсе), доступ
+ * закрывается — иначе бот отдавал бы ссылку, которая не работает.
  */
 async function refreshStatus(user) {
   try {
     const t = await api.getClientTraffic(user.email);
-    if (t && t.enable !== undefined) {
+    if (!t) {
+      // Строки трафика ещё нет, но клиент в панели есть — статус не трогаем.
+      // null = панель не ответила определённо, тоже не трогаем.
+      if (await api.clientExists(user.email) !== false) return user;
+      if (Number(user.is_active)) await db.setActive(user.tg_id, false);
+      user.is_active = 0;
+      user.panelMissing = true;
+      return user;
+    }
+    if (t.enable !== undefined) {
       const active = t.enable ? 1 : 0;
       if (Number(user.is_active) !== active) {
         await db.setActive(user.tg_id, !!active);
@@ -1076,6 +1142,9 @@ async function onQrButton(ctx) {
     return ctx.answerCbQuery('⛔ Сначала вступите в группу', { show_alert: true });
   }
   const fresh = await refreshStatus(user);
+  if (fresh.panelMissing) {
+    return ctx.answerCbQuery('⚠️ Подписка не найдена в панели — напишите администратору', { show_alert: true });
+  }
   if (!fresh.is_active) {
     return ctx.answerCbQuery('⏸ Подписка ещё не активирована', { show_alert: true });
   }
@@ -1118,7 +1187,11 @@ async function cmdStats(ctx) {
   if (!user) {
     return ctx.reply('❌ Вы не зарегистрированы. Нажмите /start для регистрации.');
   }
-  return sendStats(ctx, await refreshStatus(user));
+  const fresh = await refreshStatus(user);
+  if (fresh.panelMissing) {
+    return ctx.reply('⚠️ Ваша подписка больше не найдена в панели — обратитесь к администратору.');
+  }
+  return sendStats(ctx, fresh);
 }
 
 async function cmdHelp(ctx) {
@@ -1181,7 +1254,7 @@ EOF
 # src/handlers/admin.js
 cat > src/handlers/admin.js <<'EOF'
 const { Markup } = require('telegraf');
-const { getConfig } = require('../config');
+const { getConfig, saveConfig } = require('../config');
 const db = require('../database');
 const api = require('../api3xui');
 
@@ -1201,6 +1274,11 @@ function esc(s) {
 
 function isAdmin(ctx) {
   return String(ctx.from.id) === String(getConfig().admin_tg_id);
+}
+
+/** Панель отвечает «... not found ...», если записи клиента уже нет (удалили в веб-UI). */
+function isNotFound(e) {
+  return /not\s*found/i.test(String((e && e.message) || ''));
 }
 
 /** Ссылка на команду с предзаполненным текстом — «быстрая ссылка» на /enable, /disable. */
@@ -1238,7 +1316,8 @@ async function cmdDashboard(ctx) {
 
     const botInfo = await ctx.telegram.getMe();
     const cfg = getConfig();
-    const groupLine = cfg.panel_client_group ? `\n🏷 Группа клиентов: ${cfg.panel_client_group}` : '';
+    const groupName = String(cfg.panel_client_group || '').trim();
+    const groupLine = `\n🏷 Группа для новых клиентов: ${groupName ? `<b>${esc(groupName)}</b>` : '(без группы)'}`;
 
     await ctx.reply(
       `📊 ПАНЕЛЬ АДМИНИСТРАТОРА\n\n` +
@@ -1258,6 +1337,7 @@ async function cmdDashboard(ctx) {
       `<a href="${cmdLink(botInfo.username, 'enable', '')}">/enable</a> &lt;tg_id или email&gt; — включить подписку\n` +
       `<a href="${cmdLink(botInfo.username, 'disable', '')}">/disable</a> &lt;tg_id или email&gt; — выключить подписку\n` +
       `<a href="${cmdLink(botInfo.username, 'delete', '')}">/delete</a> &lt;tg_id или email&gt; — удалить из панели и базы\n` +
+      `<a href="${cmdLink(botInfo.username, 'setgroup', '')}">/setgroup</a> [&lt;имя&gt;] — группа панели для новых клиентов\n` +
       `<a href="${cmdLink(botInfo.username, 'broadcast', ' ')}}">/broadcast</a> &lt;текст&gt; — рассылка всей базе`,
       {
         parse_mode: 'HTML',
@@ -1265,8 +1345,9 @@ async function cmdDashboard(ctx) {
         ...Markup.inlineKeyboard([
           [
             Markup.button.callback('👥 Пользователи', 'adm:users:0'),
-            Markup.button.callback('🔄 Обновить', 'adm:dashboard'),
+            Markup.button.callback('🏷 Группа клиентов', 'adm:group'),
           ],
+          [Markup.button.callback('🔄 Обновить', 'adm:dashboard')],
         ]).reply_markup,
       }
     );
@@ -1346,11 +1427,130 @@ async function cmdUsers(ctx) {
   return buildUsersPage(ctx, 0);
 }
 
+/**
+ * Экран выбора группы клиентов панели: показывает реальные группы из панели
+ * с количеством клиентов и ссылки-команды /setgroup <имя>.
+ */
+async function buildGroupScreen(ctx) {
+  const cfg = getConfig();
+  const current = String(cfg.panel_client_group || '').trim();
+  const bot = (await ctx.telegram.getMe()).username;
+
+  let clients = [];
+  let groups = [];
+  try {
+    clients = await api.getPanelClients();
+    groups = await api.getClientGroups();
+  } catch (e) {
+    return ctx.reply(`❌ Не удалось получить клиентов из панели: ${e.message}`);
+  }
+
+  let msg = `🏷 ГРУППА КЛИЕНТОВ В ПАНЕЛИ\n\n` +
+    `Сейчас новые клиенты добавляются в: <b>${current ? esc(current) : '(без группы)'}</b>\n\n`;
+
+  if (!clients.length) {
+    msg += `📋 В панели пока нет клиентов — группа появится после создания первого.\n\n`;
+  } else {
+    msg += `👥 Клиентов в панели: ${clients.length}\n`;
+    for (const g of groups) {
+      const mark = g.name === current ? ' ✅' : '';
+      // Пустую группу выбираем sentinel'-ом "-": пустой аргумент /setgroup — это экран
+      const arg = g.name || '-';
+      msg += `• <a href="${cmdLink(bot, 'setgroup', arg)}">${g.name ? esc(g.name) : '(без группы)'}</a> — ${g.count}${mark}\n`;
+    }
+    msg += `\nНажмите на группу, чтобы выбрать её, или введите <code>/setgroup имя_группы</code> для новой.\n`;
+    msg += `<code>/setgroup -</code> — добавлять клиентов без группы.\n\n`;
+  }
+
+  msg += `⚠️ Существующие клиенты не переносятся — меняется только группа для новых регистраций.`;
+
+  return ctx.reply(msg, {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    ...Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🔄 Обновить', 'adm:group'),
+        Markup.button.callback('👑 Дашборд', 'adm:dashboard'),
+      ],
+    ]).reply_markup,
+  });
+}
+
+/**
+ * /setgroup <имя> — задать группу клиентов панели для новых регистраций.
+ * Без аргумента — показать экран выбора с реальными группами из панели.
+ */
+async function cmdSetGroup(ctx) {
+  if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
+
+  const text = (ctx.message.text || '').trim();
+  const arg = text.replace(/^\/setgroup\s*/, '').trim();
+
+  if (!arg) return buildGroupScreen(ctx);
+
+  // "-" — явный выбор «без группы» (пустой аргумент открывает экран выбора)
+  const name = /^[-—]$/.test(arg) ? '' : arg;
+
+  // Имя группы: без переносов, вразумительной длины
+  if (/[\r\n]/.test(arg)) return ctx.reply('❌ Имя группы не должно содержать перенос строки.');
+  if (Buffer.byteLength(arg, 'utf8') > 60) return ctx.reply('❌ Имя группы слишком длинное (максимум 60 байт).');
+
+  const cfg = getConfig();
+  const prev = String(cfg.panel_client_group || '').trim();
+  cfg.panel_client_group = name;
+  saveConfig(cfg);
+
+  let count = 0;
+  try {
+    count = (await api.getPanelClients()).filter(c => String(c.group || '').trim() === name).length;
+  } catch (e) {
+    count = -1;
+  }
+
+  const exists = count > 0;
+  const note = count < 0
+    ? `Панель недоступна — проверить количество клиентов в группе не удалось.`
+    : exists
+      ? `В группе уже ${count} ${pluralRu(count)}.`
+      : (name ? `Группы «${name}» ещё нет в панели — она появится после создания первого клиента.`
+              : 'Клиенты создаются без группы — в панели они окажутся в разделе без названия.');
+
+  return ctx.reply(
+    `🏷 Группа для новых клиентов: <b>${name ? esc(name) : '(без группы)'}</b>\n` +
+    (prev !== name ? `Было: ${prev ? esc(prev) : '(без группы)'}\n` : '') +
+    `${note}\n\n` +
+    `⚠️ Существующие клиенты не переносятся.`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🏷 Все группы', 'adm:group'),
+          Markup.button.callback('👑 Дашборд', 'adm:dashboard'),
+        ],
+      ]).reply_markup,
+    }
+  );
+}
+
+function pluralRu(n) {
+  const mod10 = n % 10, mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return 'клиент';
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'клиента';
+  return 'клиентов';
+}
+
 /** Общая логика вкл/выкл — используется и командами, и кнопками. */
 async function toggleClient(ctx, email, enable) {
   const bu = await db.getUserByEmail(email);
 
-  await api.setClientActive(email, enable);
+  try {
+    await api.setClientActive(email, enable);
+  } catch (e) {
+    if (isNotFound(e)) {
+      throw new Error(`клиента ${email} нет в панели — запись в базе бота устарела, удалите её через /delete ${email}`);
+    }
+    throw e;
+  }
   if (bu) await db.setActive(bu.tg_id, enable);
 
   if (enable) {
@@ -1385,6 +1585,11 @@ async function onAdminCallback(ctx) {
   if (usersMatch) {
     await ctx.answerCbQuery();
     return buildUsersPage(ctx, parseInt(usersMatch[1], 10));
+  }
+
+  if (data === 'adm:group') {
+    await ctx.answerCbQuery();
+    return buildGroupScreen(ctx);
   }
 
   const toggleMatch = data.match(/^adm:tgl:(on|off):(.+)$/);
@@ -1481,13 +1686,23 @@ async function cmdDelete(ctx) {
 
   const email = await resolveEmail(arg);
   const user = await db.getUserByEmail(email);
+
+  // Клиента могли удалить раньше прямо в веб-интерфейсе панели. Отсутствие
+  // записи — не ошибка: в этом случае убираем хотя бы «мёртвую» строку из базы.
+  let wasInPanel = true;
   try {
     await api.deleteClient(email);
-    if (user) await db.deleteUser(user.tg_id);
-    await ctx.reply(`🗑 ${email} удалён из панели и базы.`);
   } catch (e) {
-    await ctx.reply(`❌ Ошибка: ${e.message}`);
+    if (!isNotFound(e)) return ctx.reply(`❌ Ошибка: ${e.message}`);
+    wasInPanel = false;
   }
+
+  if (user) await db.deleteUser(user.tg_id);
+  await ctx.reply(
+    wasInPanel
+      ? `🗑 ${email} удалён из панели и базы.`
+      : `🗑 ${email}: в панели записи уже не было, убран из базы бота.`
+  );
 }
 
 module.exports = {
@@ -1497,6 +1712,7 @@ module.exports = {
   cmdDisable,
   cmdBroadcast,
   cmdDelete,
+  cmdSetGroup,
   onAdminCallback,
 };
 EOF
@@ -1543,6 +1759,16 @@ async function syncOnce(telegram) {
       if (u && !!u.is_active !== !!c.enable) {
         await db.setActive(u.tg_id, !!c.enable);
       }
+    }
+
+    // 1b. Клиента удалили в веб-интерфейсе панели — закрываем доступ и в боте,
+    // иначе /my_sub отдавал бы ссылку на несуществующую подписку.
+    // clientExists === false только при точном ответе панели, сбой API игнорируем.
+    for (const u of await db.getAllUsers()) {
+      if (!Number(u.is_active)) continue;
+      if (await api.clientExists(u.email) !== false) continue;
+      await db.setActive(u.tg_id, false);
+      console.log(`[sync] ${u.email} отсутствует в панели — подписка деактивирована`);
     }
 
     // 2. Ручные клиенты с указанным tgId начинают пользоваться ботом без /start
@@ -1621,6 +1847,143 @@ function startSyncLoop(telegram, intervalSec) {
 module.exports = { syncOnce, startSyncLoop, notifyNewClient };
 EOF
 
+cat > src/setupGroups.js <<'EOF'
+// Интерактивный выбор группы клиентов панели 3x-ui при установке.
+// Вызывается из installer.sh после npm install:  node src/setupGroups.js
+// Завершается с кодом 0 всегда — недоступная панель не должна ломать установку.
+//
+//   node src/setupGroups.js --print   — только вывести JSON с клиентами и группами
+//   node src/setupGroups.js --set X   — записать группу X без вопросов
+
+const readline = require('readline');
+const { getConfig, saveConfig } = require('./config');
+const api = require('./api3xui');
+
+function plural(n) {
+  const mod10 = n % 10, mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return 'клиент';
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'клиента';
+  return 'клиентов';
+}
+
+function label(name) { return name ? `"${name}"` : '"(без группы)"'; }
+
+async function collect() {
+  await api.login();
+  const clients = await api.getPanelClients();
+  const groups = await api.getClientGroups();
+  return { clients, groups };
+}
+
+function currentGroup(cfg) {
+  // Пустая строка — осознанный выбор «без группы», а не «не задано».
+  const raw = cfg.panel_client_group;
+  return raw === undefined || raw === null ? 'Telegram' : String(raw).trim();
+}
+
+async function interactive(cfg) {
+  const defGroup = currentGroup(cfg);
+
+  // Сначала подключаемся к панели, и только потом начинаем спрашивать:
+  // иначе набранный (или переданный по pipe) ответ во время ожидания ответа
+  // панели теряется, а readline закрывается с "readline was closed".
+  let data;
+  try { data = await collect(); }
+  catch (e) {
+    console.log(`\n⚠️ Панель недоступна: ${e.message}`);
+    console.log(`   Группа клиентов: ${label(defGroup)} — изменить командой /setgroup в боте.`);
+    return;
+  }
+
+  const { clients, groups } = data;
+  console.log(`\n📋 Клиентов в панели: ${clients.length}, групп клиентов: ${groups.length}`);
+
+  if (!clients.length) {
+    console.log('   В панели пока нет клиентов — группа будет создана при первой регистрации.');
+  } else {
+    groups.forEach((g, i) => {
+      const mark = g.name === defGroup ? '  ← текущая' : '';
+      console.log(`   ${i + 1}) ${label(g.name)} — ${g.count} ${plural(g.count)}${mark}`);
+    });
+    const active = clients.filter(c => c.enable).length;
+    console.log(`   🟢 включено: ${active}, ⏸ выключено: ${clients.length - active}`);
+  }
+
+  console.log('\n🏷 В какую группу панели добавлять новых клиентов бота?');
+  if (groups.length) {
+    console.log('   номер 1-' + groups.length + ' — выбрать существующую');
+    console.log('   n<имя> — создать новую, напр. nTelegram');
+    console.log('   -      — без группы');
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ans = (await new Promise(resolve =>
+    rl.question(`   Выбор [Enter — оставить ${label(defGroup)}]: `, resolve))).trim();
+  rl.close();
+
+  if (!ans) {
+    console.log(`   Оставлено: ${label(defGroup)}`);
+  } else if (ans === '-' || ans === '—') {
+    cfg.panel_client_group = '';
+    saveConfig(cfg);
+    console.log('✅ Новые клиенты будут создаваться без группы.');
+  } else if (/^n(.+)$/s.test(ans)) {
+    const name = ans.slice(1).trim();
+    cfg.panel_client_group = name;
+    saveConfig(cfg);
+    console.log(`✅ Новая группа: ${label(name)} — применится к следующим регистрациям.`);
+  } else {
+    const idx = parseInt(ans, 10);
+    if (idx >= 1 && idx <= groups.length) {
+      const g = groups[idx - 1];
+      cfg.panel_client_group = g.name;
+      saveConfig(cfg);
+      console.log(`✅ Выбрана группа ${label(g.name)} (${g.count} ${plural(g.count)}).`);
+    } else {
+      console.log(`   Не поняли ввод, оставлено: ${label(defGroup)}`);
+    }
+  }
+}
+
+async function main() {
+  const cfg = getConfig();
+
+  if (process.argv.includes('--print')) {
+    try {
+      const { clients, groups } = await collect();
+      console.log(JSON.stringify({
+        total: clients.length,
+        enabled: clients.filter(c => c.enable).length,
+        groups,
+        current: currentGroup(cfg),
+      }, null, 2));
+    } catch (e) { console.log(JSON.stringify({ error: e.message })); process.exitCode = 2; }
+    return;
+  }
+
+  const si = process.argv.indexOf('--set');
+  if (si > 0) {
+    const name = String(process.argv[si + 1] || '').trim();
+    cfg.panel_client_group = name;
+    saveConfig(cfg);
+    console.log(`✅ Группа клиентов: ${label(name)}`);
+    return;
+  }
+
+  // Без stdin (например, curl | bash) вопросы бессмысленны — оставляем дефолт.
+  // SETUP_INTERACTIVE=1 форсирует вопросы (используется в тестах).
+  if (!process.stdin.isTTY && !process.env.SETUP_INTERACTIVE) {
+    console.log(`\nℹ️ Неинтерактивный режим — группа: ${label(currentGroup(cfg))}`);
+    console.log('   Настроить: /setgroup в боте или node src/setupGroups.js');
+    return;
+  }
+
+  await interactive(cfg);
+}
+
+main().catch(e => { console.log(`\n⚠️ Пропущено: ${e.message}`); });
+EOF
+
 cat > src/index.js <<'EOF'
 const { Telegraf } = require('telegraf');
 const { getConfig } = require('./config');
@@ -1660,6 +2023,7 @@ async function main() {
   bot.command('disable', adminHandlers.cmdDisable);
   bot.command('broadcast', adminHandlers.cmdBroadcast);
   bot.command('delete', adminHandlers.cmdDelete);
+  bot.command('setgroup', adminHandlers.cmdSetGroup);
 
   // Inline-кнопки
   bot.action(/^grp:check$/, userHandlers.onGroupCheck);
@@ -1708,6 +2072,10 @@ EOF
 # Install dependencies
 info "Установка npm-зависимостей..."
 npm install --production
+
+# Проверка панели: клиенты и группы клиентов
+info "Подключение к панели 3x-ui — проверка клиентов и групп..."
+node src/setupGroups.js || warn "Группу клиентов позже можно поменять: /setgroup в боте или node src/setupGroups.js"
 
 # Systemd service
 SERVICE_NAME="tg-bot-3xui"
