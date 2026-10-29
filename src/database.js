@@ -202,6 +202,22 @@ async function importPanelClient({ tgId, email, subId, uuid, trafficLimit }) {
   return getUserByTgId(tgId);
 }
 
+/**
+ * Перезапись кредов клиента после восстановления в панели:
+ * панель выдаёт новый uuid, sub_id может смениться, доступ снова выключен
+ * (ждёт активации админом).
+ */
+async function resetUserClient({ tgId, uuid, subId, trafficLimit }) {
+  const d = await getDb();
+  d.run(
+    'UPDATE users SET uuid = ' + sqlStr(uuid) + ', sub_id = ' + sqlStr(subId) +
+    ', is_active = 0, traffic_limit = ' + (Number(trafficLimit) || 0) +
+    ' WHERE tg_id = ' + Number(tgId)
+  );
+  saveDb();
+  return getUserByTgId(tgId);
+}
+
 module.exports = {
   getDb,
   saveDb,
@@ -215,4 +231,5 @@ module.exports = {
   syncPanelClients,
   markPanelClientNotified,
   importPanelClient,
+  resetUserClient,
 };

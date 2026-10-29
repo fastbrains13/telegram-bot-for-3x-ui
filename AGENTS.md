@@ -95,6 +95,13 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
   флаг `panelMissing` (не сохраняется в БД, только в объекте) → `/my_sub`, `/stats`, `sub:qr`
   отвечают «⚠️ Ваша подписка больше не найдена в панели»;
 - `syncOnce`: то же для всех активных пользователей на каждом тике;
+- **восстановление**: `/start` при записи в базе сначала проверяет `clientExists(email)` — если
+  клиента в панели точно нет, `recoverSubscription()` пересоздаёт его с **прежними email и
+  `sub_id`** (ссылка подписки и QR не меняются!) и прежним `traffic_limit`, `enable:false` —
+  активация снова за админом. Тот же путь — по кнопке `sub:recover` («♻️ Восстановить подписку»),
+  которую показывают `subscriptionGone()` из `/my_sub`, `/stats`, QR. В БД это `db.resetUserClient()`
+  (UPDATE uuid/sub_id/is_active=0/traffic_limit), НЕ `deleteUser + addUser` — иначе потеряется
+  `group_joined` и имя;
 - `/delete` не падает, если в панели записи уже нет (`isNotFound()` по сообщению панели) —
   строка из `users` удаляется в любом случае; `/enable` отсутствующего клиента даёт внятную ошибку
   с подсказкой `/delete <email>`.
@@ -125,12 +132,18 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
 ### 9. Inline-кнопки и ссылки-команды
 - `callback_data` ≤ 64 байт — email клиента проверяется (`Buffer.byteLength <= 55`) перед
   кнопкой `adm:tgl:on|off:<email>`.
-- Префиксы: `menu:` (главное меню), `grp:check`, `sub:qr` — в `user.onMenuCallback/onGroupCheck/onQrButton`;
-  `adm:` (users-пагинация, toggle, dashboard) — в `admin.onAdminCallback`. Новые кнопки регистрировать
-  через `bot.action(/^префикс:.+$/, ...)` в `src/index.js`.
+- Префиксы: `menu:` (главное меню), `grp:check`, `sub:qr`, `sub:recover` — в `user.onMenuCallback /
+  onGroupCheck / onQrButton / onRecoverButton`; `adm:` (users, toggle, dashboard, group) —
+  в `admin.onAdminCallback`. Новые кнопки регистрировать через `bot.action(/^префикс:.+$/, ...)`
+  в `src/index.js`.
+- **`/users` выводит АБСОЛЮТНО ВСЕХ клиентов панели — пагинации нет.** Telegram режет длину
+  сообщения, поэтому блоки склеиваются по `MAX_MESSAGE = 3600` символов и отправляются
+  несколькими сообщениями с заголовком `👥 Все клиенты панели: N` и меткой `📄 Часть i из N`;
+  между частями — `sleep(1100)` против лимита 429. Inline-кнопки (`adm:users`) остаются только
+  навигационными и только на последнем сообщении.
 - **В `/users` переключение клиента — НЕ inline-кнопкой, а ссылкой-командой**
   `https://t.me/{bot}?text=%2Fenable%20<email>` (`cmdLink` в admin.js, `encodeURIComponent`).
-  Inline остаются только навигация (`adm:users:N`, `adm:dashboard`, `adm:group`) и кнопка в
+  Inline остаются навигация (`adm:users`, `adm:dashboard`, `adm:group`) и кнопка в
   уведомлении о новом клиенте. Аргумент `/enable|/disable|/delete` — `tg_id` **или** email:
   разрешается через `resolveEmail()` (users → getClientByTgId → как есть).
 - Текст `/help` НЕ должен содержать админ-команд; они выводятся в `/dashboard`.
@@ -160,7 +173,10 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
    syncOnce (уведомление админа + отсутствие дублей) → панельный toggle → статус в боте → adm:tgl →
    /broadcast → /delete. Плюс: `__panel_del` → «не найдена в панели» в /sub, /stats, QR → /delete
    чистит базу; `/setgroup` (экран/смена/`-`/длинное имя/не-админ) → новая регистрация в выбранную
-   группу без рестарта; `node src/setupGroups.js --print|--set` и интерактив через `SETUP_INTERACTIVE=1`.
+    группу без рестарта; `node src/setupGroups.js --print|--set` и интерактив через `SETUP_INTERACTIVE=1`.
+    Отдельно проверять: `/start` после `__panel_del` пересоздаёт клиента с ТЕМ ЖЕ `sub_id` и
+    `enable:false` (ссылка не меняется), кнопка `sub:recover`, `/start` живого клиента не пересоздаёт;
+    `/users` на 25+ клиентах — сообщений несколько, но показаны ВСЕ email, длина каждого ≤ лимита.
 4. Тест единой квоты: registerUser → inject up/down с «разных инбаундов» → used = up+down из ОДНОЙ
    строки traffic, remaining = total − used.
 5. Пересинхрон installer.sh + `bash -n installer.sh` + сверка блоков с src (строгое равенство).

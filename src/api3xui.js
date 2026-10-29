@@ -168,8 +168,9 @@ async function getOnlineCount() {
  * поэтому total — единая квота на все инбаунды, а up/down суммируются с любого.
  * Кредиты (uuid/password/...) панель генерирует сама под протокол каждого инбаунда.
  */
-async function registerUser({ email, subId, tgId, inboundIds }) {
-  const total = trafficBytes();
+async function registerUser({ email, subId, tgId, inboundIds, totalGB }) {
+  // totalGB передаётся при восстановлении клиента, чтобы сохранить прежний лимит
+  const total = Number(totalGB) > 0 ? Number(totalGB) : trafficBytes();
   // Имя группы клиентов в панели (поле group) — например "Telegram"
   const groupName = String(getConfig().panel_client_group || '').trim();
 

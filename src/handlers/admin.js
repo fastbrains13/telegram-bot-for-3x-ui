@@ -4,7 +4,8 @@ const db = require('../database');
 const api = require('../api3xui');
 
 const GiB = 1024 * 1024 * 1024;
-const PAGE_SIZE = 10;
+// Лимит текста сообщения в Telegram — 4096 символов; держим запас на хедер частей
+const MAX_MESSAGE = 3600;
 
 function fmtGB(bytes) {
   return (bytes / GiB).toFixed(2) + ' ГБ';
@@ -19,6 +20,10 @@ function esc(s) {
 
 function isAdmin(ctx) {
   return String(ctx.from.id) === String(getConfig().admin_tg_id);
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 /** Панель отвечает «... not found ...», если записи клиента уже нет (удалили в веб-UI). */
@@ -78,7 +83,7 @@ async function cmdDashboard(ctx) {
       `📦 Панель: ${status && status.panelVersion ? status.panelVersion : 'N/A'}\n` +
       `🔌 API: ${mode} — ${quotaNote}${groupLine}\n\n` +
       `👑 КОМАНДЫ АДМИНИСТРАТОРА\n` +
-      `<a href="${cmdLink(botInfo.username, 'users', '')}">/users</a> — список клиентов панели со ссылками вкл/выкл\n` +
+      `<a href="${cmdLink(botInfo.username, 'users', '')}">/users</a> — абсолютно все клиенты панели, ссылки вкл/выкл/удалить\n` +
       `<a href="${cmdLink(botInfo.username, 'enable', '')}">/enable</a> &lt;tg_id или email&gt; — включить подписку\n` +
       `<a href="${cmdLink(botInfo.username, 'disable', '')}">/disable</a> &lt;tg_id или email&gt; — выключить подписку\n` +
       `<a href="${cmdLink(botInfo.username, 'delete', '')}">/delete</a> &lt;tg_id или email&gt; — удалить из панели и базы\n` +
@@ -89,7 +94,7 @@ async function cmdDashboard(ctx) {
         disable_web_page_preview: true,
         ...Markup.inlineKeyboard([
           [
-            Markup.button.callback('👥 Пользователи', 'adm:users:0'),
+            Markup.button.callback('👥 Пользователи', 'adm:users'),
             Markup.button.callback('🏷 Группа клиентов', 'adm:group'),
           ],
           [Markup.button.callback('🔄 Обновить', 'adm:dashboard')],
@@ -102,10 +107,12 @@ async function cmdDashboard(ctx) {
 }
 
 /**
- * /users — показываем ВСЕХ клиентов панели, а не только зарегистрированных ботом.
- * Рядом с каждым — ссылки-команды на включение/выключение/удаление.
+ * /users — ВСЕ клиенты панели, включая заведённых вручную.
+ * Список не режется по количеству: лимит Telegram — длина сообщения, поэтому
+ * блоки склеиваются по размеру и отправляются несколькими сообщениями,
+ * чтобы админ видел каждого клиента, а не первую десятку.
  */
-async function buildUsersPage(ctx, page) {
+async function buildUsersPage(ctx) {
   const botInfo = await ctx.telegram.getMe();
   const bot = botInfo.username;
 
@@ -119,22 +126,14 @@ async function buildUsersPage(ctx, page) {
   const botUsers = await db.getAllUsers();
   const byEmail = new Map(botUsers.map(u => [u.email, u]));
 
-  // Свои (из базы бота) — на первой странице, затем остальные клиенты панели
+  // Свои (из базы бота) — первыми, затем остальные клиенты панели
   const own = clients.filter(c => byEmail.has(c.email));
   const foreign = clients.filter(c => !byEmail.has(c.email));
   const sorted = [...own, ...foreign];
 
   if (!sorted.length) return ctx.reply('👥 В панели нет клиентов.');
 
-  const pages = Math.ceil(sorted.length / PAGE_SIZE);
-  const cur = Math.max(0, Math.min(page, pages - 1));
-  const slice = sorted.slice(cur * PAGE_SIZE, cur * PAGE_SIZE + PAGE_SIZE);
-
-  let msg = `👥 Клиенты панели: ${sorted.length}\n` +
-    `🗂 Через бота: ${own.length} · ➕ Заведены вручную: ${foreign.length}\n` +
-    `Страница ${cur + 1} из ${pages}\n\n`;
-
-  for (const c of slice) {
+  const blocks = sorted.map(c => {
     const bu = byEmail.get(c.email);
     const used = (c.up || 0) + (c.down || 0);
     const mark = bu ? (bu.is_active ? '🟢' : '🔴') : '⚪';
@@ -142,34 +141,51 @@ async function buildUsersPage(ctx, page) {
       ? `${bu.tg_id} · ${esc(bu.tg_first_name || bu.tg_username || 'без имени')}`
       : (c.tgId ? `${c.tgId} · вручную` : 'без Telegram ID');
 
-    msg += `${mark} <code>${esc(c.email)}</code> — ${who}\n` +
-      `   ${fmtGB(used)} из ${fmtGB(c.total || 0)} · ${c.enable ? '🟢 вкл' : '🔴 выкл'}\n`;
-
     // Ссылки-команды: открывают чат с уже набранным сообщением
-    const links = c.enable
-      ? [`<a href="${cmdLink(bot, 'disable', c.email)}">⏸ Выключить</a>`,
-         `<a href="${cmdLink(bot, 'delete', c.email)}">🗑 Удалить</a>`]
-      : [`<a href="${cmdLink(bot, 'enable', c.email)}">▶️ Включить</a>`,
-         `<a href="${cmdLink(bot, 'delete', c.email)}">🗑 Удалить</a>`];
-    msg += `   ${links.join(' · ')}\n\n`;
-  }
+    const toggle = c.enable
+      ? `<a href="${cmdLink(bot, 'disable', c.email)}">⏸ Выключить</a>`
+      : `<a href="${cmdLink(bot, 'enable', c.email)}">▶️ Включить</a>`;
 
-  const nav = [];
-  if (cur > 0) nav.push(Markup.button.callback('◀️ Назад', `adm:users:${cur - 1}`));
-  nav.push(Markup.button.callback('🔄 Обновить', `adm:users:${cur}`));
-  nav.push(Markup.button.callback('👑 Дашборд', 'adm:dashboard'));
-  if (cur < pages - 1) nav.push(Markup.button.callback('Вперёд ▶️', `adm:users:${cur + 1}`));
-
-  return ctx.reply(msg, {
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-    ...Markup.inlineKeyboard([nav]).reply_markup,
+    return `${mark} <code>${esc(c.email)}</code> — ${who}\n` +
+      `   ${fmtGB(used)} из ${fmtGB(c.total || 0)} · ${c.enable ? '🟢 вкл' : '🔴 выкл'}\n` +
+      `   ${toggle} · <a href="${cmdLink(bot, 'delete', c.email)}">🗑 Удалить</a>\n\n`;
   });
+
+  const parts = [];
+  let cur = '';
+  for (const b of blocks) {
+    if (cur && cur.length + b.length > MAX_MESSAGE) {
+      parts.push(cur);
+      cur = '';
+    }
+    cur += b;
+  }
+  if (cur) parts.push(cur);
+
+  for (let i = 0; i < parts.length; i++) {
+    const head = i === 0
+      ? `👥 Все клиенты панели: ${sorted.length}\n` +
+        `🗂 Через бота: ${own.length} · ➕ Заведены вручную: ${foreign.length}\n\n`
+      : `👥 Клиенты панели: ${sorted.length}\n\n`;
+    const tag = parts.length > 1 ? `📄 Часть ${i + 1} из ${parts.length}\n\n` : '';
+
+    const opts = { parse_mode: 'HTML', disable_web_page_preview: true };
+    if (i === parts.length - 1) {
+      Object.assign(opts, Markup.inlineKeyboard([[
+        Markup.button.callback('🔄 Обновить', 'adm:users'),
+        Markup.button.callback('🏷 Группа', 'adm:group'),
+        Markup.button.callback('👑 Дашборд', 'adm:dashboard'),
+      ]]).reply_markup);
+    }
+    await ctx.reply(head + tag + parts[i], opts);
+    // Чересчур быстрые сообщения Telegram режет лимитом 429 — выдерживаем паузу
+    if (i < parts.length - 1) await sleep(1100);
+  }
 }
 
 async function cmdUsers(ctx) {
   if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
-  return buildUsersPage(ctx, 0);
+  return buildUsersPage(ctx);
 }
 
 /**
@@ -326,10 +342,10 @@ async function onAdminCallback(ctx) {
     return cmdDashboard(ctx);
   }
 
-  const usersMatch = data.match(/^adm:users:(\d+)$/);
-  if (usersMatch) {
+  // adm:users:N — старая пагинация; номер игнорируется, показываем всех
+  if (/^adm:users(?::\d+)?$/.test(data)) {
     await ctx.answerCbQuery();
-    return buildUsersPage(ctx, parseInt(usersMatch[1], 10));
+    return buildUsersPage(ctx);
   }
 
   if (data === 'adm:group') {
@@ -344,7 +360,7 @@ async function onAdminCallback(ctx) {
     try {
       await toggleClient(ctx, email, enable);
       await ctx.answerCbQuery(enable ? '✅ Включён' : '⏸ Выключен');
-      return buildUsersPage(ctx, 0);
+      return buildUsersPage(ctx);
     } catch (e) {
       await ctx.answerCbQuery('❌ ' + e.message, { show_alert: true });
       return;

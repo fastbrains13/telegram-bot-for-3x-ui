@@ -41,6 +41,7 @@ async function main() {
   // Inline-кнопки
   bot.action(/^grp:check$/, userHandlers.onGroupCheck);
   bot.action(/^sub:qr$/, userHandlers.onQrButton);
+  bot.action(/^sub:recover$/, userHandlers.onRecoverButton);
   bot.action(/^menu:.+$/, userHandlers.onMenuCallback);
   bot.action(/^adm:.+$/, adminHandlers.onAdminCallback);
 

@@ -81,7 +81,14 @@ async function cmdStart(ctx) {
   const cfg = getConfig();
   const tgId = ctx.from.id;
 
-  if (await db.getUserByTgId(tgId)) {
+  const existing = await db.getUserByTgId(tgId);
+  if (existing) {
+    // Запись в базе есть, но клиента могли удалить в веб-интерфейсе панели.
+    // Тогда /start не отказывает, а пересоздаёт клиента — иначе пользователь
+    // остаётся с «призрачной» подпиской, которая ничего не отдаёт.
+    if (await api.clientExists(existing.email) === false) {
+      return recoverSubscription(ctx, existing);
+    }
     return ctx.reply('ℹ️ Вы уже зарегистрированы. Откройте подписку кнопкой ниже.', mainKeyboard(ctx, cfg));
   }
 
@@ -147,6 +154,96 @@ async function cmdStart(ctx) {
   } catch (err) {
     await ctx.reply(`❌ Ошибка регистрации: ${err.message}`);
   }
+}
+
+/**
+ * Восстановление подписки: клиента удалили в панели, а запись в базе бота осталась.
+ * Создаём клиента заново (прежние email и sub_id → ссылка подписки не меняется,
+ * прежний лимит), доступ снова выключен до активации админом.
+ */
+async function recoverSubscription(ctx, user) {
+  const cfg = getConfig();
+
+  try {
+    const inbounds = await api.getInbounds();
+    if (!inbounds.length) {
+      return ctx.reply('❌ В панели нет ни одного inbound — восстановление невозможно.');
+    }
+    const inboundIds = inbounds.map(ib => ib.id);
+    const subId = user.sub_id || genSubId();
+
+    const { uuid, total } = await api.registerUser({
+      email: user.email,
+      subId,
+      tgId: user.tg_id,
+      inboundIds,
+      totalGB: Number(user.traffic_limit) || 0,
+    });
+    const fresh = await db.resetUserClient({
+      tgId: user.tg_id, uuid: uuid || '', subId, trafficLimit: total,
+    });
+
+    // Требование группы остаётся в силе, если оно не было подтверждено раньше
+    if (cfg.tg_group_id && !fresh.group_joined) {
+      let link = user.group_invite_link || '';
+      try {
+        link = (await getGroupLink(ctx, cfg)).link;
+      } catch (e) {
+        /* панель/группа недоступны — остаёмся с прежней ссылкой */
+      }
+      if (link) {
+        await db.setGroupJoined(user.tg_id, false, link);
+        const joined = await isGroupMember(ctx, user.tg_id);
+        if (joined) await db.setGroupJoined(user.tg_id, true, link);
+        return ctx.reply(
+          `♻️ Подписка восстановлена, но нужно подтверждение группы.\n\n` +
+          `📋 Email: ${user.email}\n` +
+          `⏸ Доступ активирует администратор\n\n` +
+          `👉 Нажмите «Вступить в группу», затем «Я вступил».`,
+          Markup.inlineKeyboard([
+            [Markup.button.url('👥 Вступить в группу', link)],
+            [Markup.button.callback(joined ? '✅ Вы в группе' : '✔️ Я вступил', 'grp:check')],
+          ])
+        );
+      }
+    }
+
+    return ctx.reply(
+      `♻️ Подписка восстановлена\n\n` +
+      `Клиент был удалён из панели — мы создали его заново.\n` +
+      `📋 Email: ${user.email}\n` +
+      `🌐 Инбаундов: ${inboundIds.length}\n` +
+      `📊 Лимит: ${(total / GiB).toFixed(0)} ГБ — общий на все инбаунды\n` +
+      `⏸ Доступ снова активирует администратор`,
+      mainKeyboard(ctx, cfg)
+    );
+  } catch (err) {
+    return ctx.reply(`❌ Не удалось восстановить подписку: ${err.message}`);
+  }
+}
+
+/** Кнопка «♻️ Восстановить» — то же, что /start для «призрачной» подписки. */
+async function onRecoverButton(ctx) {
+  const user = await db.getUserByTgId(ctx.from.id);
+  if (!user) return ctx.answerCbQuery('Сначала нажмите /start');
+
+  const exists = await api.clientExists(user.email).catch(() => null);
+  if (exists) {
+    await ctx.answerCbQuery('✅ Клиент в панели на месте');
+    return cmdMySub(ctx);
+  }
+  await ctx.answerCbQuery('Создаю клиента в панели…');
+  return recoverSubscription(ctx, user);
+}
+
+/** Сообщение о том, что подписку удалили из панели, с кнопкой восстановления. */
+function subscriptionGone(ctx) {
+  return ctx.reply(
+    `⚠️ Ваша подписка больше не найдена в панели — обратитесь к администратору.\n\n` +
+    `Можно восстановить её самостоятельно: клиент будет создан заново, ` +
+    `активацию потребуется подтвердить повторно.`,
+    Markup.inlineKeyboard([[Markup.button.callback('♻️ Восстановить подписку', 'sub:recover')]])
+  );
 }
 
 /** Кнопка «Я вступил» — проверяем состав группы. */
@@ -218,9 +315,7 @@ async function cmdMySub(ctx) {
   // флаг panelMissing, если записи о клиенте в панели больше нет.
   const fresh = await refreshStatus(user);
   if (fresh.panelMissing) {
-    return ctx.reply(
-      '⚠️ Ваша подписка больше не найдена в панели — обратитесь к администратору.'
-    );
+    return subscriptionGone(ctx);
   }
   if (!fresh.is_active) {
     return ctx.reply('⏸ Ваша подписка ещё не активирована администратором.', mainKeyboard(ctx, cfg));
@@ -272,14 +367,16 @@ async function sendQr(ctx, user) {
 }
 
 async function onQrButton(ctx) {
-  const user = await db.getUserByTgId(ctx.from.id);
+  // findUser, а не только база бота: клиент, заведённый вручную в панели с tgId,
+  // должен получать QR так же, как /sub и /stats
+  const user = await findUser(ctx);
   if (!user) return ctx.answerCbQuery('Сначала нажмите /start');
   if (getConfig().tg_group_id && !user.group_joined) {
     return ctx.answerCbQuery('⛔ Сначала вступите в группу', { show_alert: true });
   }
   const fresh = await refreshStatus(user);
   if (fresh.panelMissing) {
-    return ctx.answerCbQuery('⚠️ Подписка не найдена в панели — напишите администратору', { show_alert: true });
+    return ctx.answerCbQuery('⚠️ Подписка не найдена в панели — нажмите /start для восстановления', { show_alert: true });
   }
   if (!fresh.is_active) {
     return ctx.answerCbQuery('⏸ Подписка ещё не активирована', { show_alert: true });
@@ -325,7 +422,7 @@ async function cmdStats(ctx) {
   }
   const fresh = await refreshStatus(user);
   if (fresh.panelMissing) {
-    return ctx.reply('⚠️ Ваша подписка больше не найдена в панели — обратитесь к администратору.');
+    return subscriptionGone(ctx);
   }
   return sendStats(ctx, fresh);
 }
@@ -355,9 +452,8 @@ async function onMenuCallback(ctx) {
   }
   if (data === 'menu:stats') {
     await ctx.answerCbQuery();
-    const user = await db.getUserByTgId(ctx.from.id);
-    if (!user) return ctx.reply('❌ Вы не зарегистрированы. Нажмите /start.');
-    return sendStats(ctx, user);
+    // cmdStats сам разберётся: база бота → импорт клиента панели → сверка статуса
+    return cmdStats(ctx);
   }
   if (data === 'menu:qr') return onQrButton(ctx);
   if (data === 'menu:help') {
@@ -382,6 +478,8 @@ module.exports = {
   mainKeyboard,
   onGroupCheck,
   onQrButton,
+  onRecoverButton,
+  recoverSubscription,
   onMenuCallback,
   isGroupMember,
 };
