@@ -134,16 +134,14 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
   onQrButton / onRecoverButton`; `adm:` (users, toggle, dashboard, group) —
   в `admin.onAdminCallback`. Новые кнопки регистрировать через `bot.action(/^префикс:.+$/, ...)`
   в `src/index.js`.
-- **`/users` выводит АБСОЛЮТНО ВСЕХ клиентов панели — пагинации нет.** Telegram режет длину
-  сообщения, поэтому блоки склеиваются по `MAX_MESSAGE = 3600` символов и отправляются
-  несколькими сообщениями с заголовком `👥 Все клиенты панели: N` и меткой `📄 Часть i из N`;
-  между частями — `sleep(1100)` против лимита 429. Inline-кнопки (`adm:users`) остаются только
-  навигационными и только на последнем сообщении.
-- **В `/users` переключение клиента — НЕ inline-кнопкой, а ссылкой-командой**
+- **`/users` — пагинация по 15 человек (`PAGE_SIZE = 15`).** Свои (из базы бота) — первыми, затем заведённые вручную. Навигация inline-кнопками (`◀️ Назад`, `🔄 Обновить`, `Вперёд ▶️`, `👑 Дашборд`) внизу страницы; переключение страницы — `adm:users:<N>`.
+- **В `/users` переключение клиента — ссылкой-командой**
   `https://t.me/{bot}?text=%2Fenable%20<email>` (`cmdLink` в admin.js, `encodeURIComponent`).
   Inline остаются навигация (`adm:users`, `adm:dashboard`, `adm:group`) и кнопка в
   уведомлении о новом клиенте. Аргумент `/enable|/disable|/delete` — `tg_id` **или** email:
   разрешается через `resolveEmail()` (users → getClientByTgId → как есть).
+- **`/dashboard`** — команды администратора выводятся inline-кнопками (`adm:enable`, `adm:disable`,
+  `adm:delete`, `adm:broadcast`), каждая открывает подсказку по аргументу.
 - Текст `/help` НЕ должен содержать админ-команд; они выводятся в `/dashboard`.
 
 ## Стиль кода
@@ -175,7 +173,7 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
     группу без рестарта; `node src/setupGroups.js --print|--set` и интерактив через `SETUP_INTERACTIVE=1`.
     Отдельно проверять: `/start` после `__panel_del` пересоздаёт клиента с ТЕМ ЖЕ `sub_id` и
     `enable:false` (ссылка не меняется), кнопка `sub:recover`, `/start` живого клиента не пересоздаёт;
-    `/users` на 25+ клиентах — сообщений несколько, но показаны ВСЕ email, длина каждого ≤ лимита.
+    `/users` на 25+ клиентах — 2 страницы по 15 и 10, навигация «◀️ Назад / Вперёд ▶️».
 4. Тест единой квоты: registerUser → inject up/down с «разных инбаундов» → used = up+down из ОДНОЙ
    строки traffic, remaining = total − used.
 5. Пересинхрон installer.sh + `bash -n installer.sh` + сверка блоков с src (строгое равенство).
