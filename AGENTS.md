@@ -3,7 +3,7 @@
 ## О проекте
 
 Telegram-бот для панели [3x-ui](https://github.com/MHSanaei/3x-ui): саморегистрация пользователей,
-обязательная привязка к Telegram-группе, активация админом, подписка/QR/статистика, рассылка, дашборд,
+активация админом, подписка/QR/статистика, рассылка, дашборд,
 фоновая синхронизация со ВСЕМИ клиентами панели.
 Стек: Node.js ≥18, CommonJS, telegraf 4, sql.js (WebAssembly SQLite), undici, qrcode.
 
@@ -80,8 +80,8 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
 1. `getPanelClients()` → снимок в таблицу `panel_clients` (email PK, `notified` против дублей);
 2. `is_active` в `users` приводится к `enable` из панели (включили вручную в веб-UI → бот показывает
    активно, и наоборот);
-3. новый клиент с ненулевым `tgId` импортируется в `users` (`group_joined=1` — требование группы
-   к ручным клиентам не применяется), после чего он пользуется `/my_sub`/`/stats`/QR без `/start`;
+3. новый клиент с ненулевым `tgId` импортируется в `users` (`group_joined=1` ставится для
+   совместимости со старыми базами), после чего он пользуется `/my_sub`/`/stats`/QR без `/start`;
 4. админу шлётся `🆕 Новый клиент в панели` с inline-кнопкой `adm:tgl:on|off:<email>`.
 
 Аналогично `refreshStatus(user)` в `user.js` — точечная сверка с `getClientTraffic().enable` перед
@@ -121,19 +121,17 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
 учитывать, что в старых базах колонок нет до первой миграции. `better-sqlite3` не использовать —
 не компилируется без node-gyp/Xcode CLT, только `sql.js`.
 
-### 8. Обязательная привязка к группе
-`tg_group_id` задан → регистрация без группы невозможна:
-- ссылка: `createChatInviteLink` (бот-админ с Invite users) → фолбэк `group_link` из конфига →
-  иначе ошибка и **откат регистрации** (deleteClient + deleteUser);
-- подтверждение: кнопка `grp:check` → `getChatMember` (статус creator/administrator/member);
-- `/my_sub`, `sub:qr`, `menu:qr` заблокированы, пока `group_joined != 1`.
-- Импортированные из панели клиенты получают `group_joined = 1` сразу.
+### 8. Telegram-группа — факультативно
+`tg_group_id` и `group_link` задаются в конфиге (по желанию). Если заданы — в главном меню
+появляется кнопка «👥 Наша группа» с ссылкой `group_link`. Вступление **не проверяется**,
+`group_joined` не влияет на выдачу подписки, QR, статистики.
+`group_joined` остаётся в БД для обратной совместимости и для клиентов, импортированных из панели.
 
 ### 9. Inline-кнопки и ссылки-команды
 - `callback_data` ≤ 64 байт — email клиента проверяется (`Buffer.byteLength <= 55`) перед
   кнопкой `adm:tgl:on|off:<email>`.
-- Префиксы: `menu:` (главное меню), `grp:check`, `sub:qr`, `sub:recover` — в `user.onMenuCallback /
-  onGroupCheck / onQrButton / onRecoverButton`; `adm:` (users, toggle, dashboard, group) —
+- Префиксы: `menu:` (главное меню), `sub:qr`, `sub:recover` — в `user.onMenuCallback /
+  onQrButton / onRecoverButton`; `adm:` (users, toggle, dashboard, group) —
   в `admin.onAdminCallback`. Новые кнопки регистрировать через `bot.action(/^префикс:.+$/, ...)`
   в `src/index.js`.
 - **`/users` выводит АБСОЛЮТНО ВСЕХ клиентов панели — пагинации нет.** Telegram режет длину
@@ -168,7 +166,8 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
    Каждый тест начинается с `__reset` и своего чистого `data/config.json` + `rm data/bot.db`,
    иначе состояние мока и кэш `getConfig()` протекают между прогонами.
 3. E2E с фейковым ctx (объект с `from/message/callbackQuery/reply/replyWithPhoto/answerCbQuery/telegram`)
-   прогоняет: /start (проверка `group` клиента панели) → grp:check → /enable → /my_sub (ссылка = `subURI`
+   прогоняет: /start (проверка `group` клиента панели; с заполненными `tg_group_id`/`group_link`
+   в конфиге — тексты НЕ должны упоминать вступление) → /enable → /my_sub (ссылка = `subURI`
    панели, НЕ `panel_url`, НЕ `vless://`) → /stats → /users (ссылки-команды, все клиенты панели) →
    syncOnce (уведомление админа + отсутствие дублей) → панельный toggle → статус в боте → adm:tgl →
    /broadcast → /delete. Плюс: `__panel_del` → «не найдена в панели» в /sub, /stats, QR → /delete

@@ -39,44 +39,6 @@ function mainKeyboard(ctx, cfg) {
   return Markup.inlineKeyboard(rows);
 }
 
-/**
- * Ссылка-приглашение в группу выдаётся всегда:
- * сначала персональная ссылка (бот-админ с Invite users),
- * при неудаче — публичная ссылка из конфига.
- */
-async function getGroupLink(ctx, cfg) {
-  if (!cfg.tg_group_id) return { link: '', required: false };
-
-  try {
-    const inv = await ctx.telegram.createChatInviteLink(cfg.tg_group_id, {
-      member_limit: 100000,
-      name: `bot_user_${ctx.from.id}`,
-    });
-    if (inv && inv.invite_link) return { link: inv.invite_link, required: true };
-  } catch (e) {
-    // нет прав админа в группе — переходим к публичной ссылке
-  }
-
-  if (cfg.group_link) return { link: cfg.group_link, required: true };
-
-  throw new Error(
-    'не удалось получить ссылку-приглашение в группу. Добавьте бота админом в группу ' +
-    'с правом «Invite users» или пропишите публичную ссылку в data/config.json → group_link.'
-  );
-}
-
-/** Проверка членства в группе. */
-async function isGroupMember(ctx, tgId) {
-  const cfg = getConfig();
-  if (!cfg.tg_group_id) return true;
-  try {
-    const member = await ctx.telegram.getChatMember(cfg.tg_group_id, tgId);
-    return ['creator', 'administrator', 'member'].includes(member.status);
-  } catch (e) {
-    return false;
-  }
-}
-
 async function cmdStart(ctx) {
   const cfg = getConfig();
   const tgId = ctx.from.id;
@@ -114,39 +76,9 @@ async function cmdStart(ctx) {
       trafficLimit: total,
     });
 
-    // Привязка к группе обязательна: без неё регистрация не завершена
-    let group = { link: '', required: false };
-    try {
-      group = await getGroupLink(ctx, cfg);
-    } catch (e) {
-      await api.deleteClient(email);
-      await db.deleteUser(tgId);
-      return ctx.reply(`❌ Регистрация отменена: ${e.message}`);
-    }
-
-    if (group.required) {
-      await db.setGroupJoined(tgId, false, group.link);
-      const joined = await isGroupMember(ctx, tgId);
-      if (joined) await db.setGroupJoined(tgId, true, group.link);
-
-      return ctx.reply(
-        `✅ Аккаунт создан, но нужно вступить в группу.\n\n` +
-        `📋 Email: ${email}\n` +
-        `📊 Лимит: ${cfg.default_traffic_gb} ГБ — общий на все инбаунды\n` +
-        `⏸ Доступ активирует администратор\n\n` +
-        `👉 Нажмите «Вступить в группу», затем «Я вступил». ` +
-        `Пока вы в группе не подтверждены, подписка не откроется.`,
-        Markup.inlineKeyboard([
-          [Markup.button.url('👥 Вступить в группу', group.link)],
-          [Markup.button.callback(joined ? '✅ Вы в группе' : '✔️ Я вступил', 'grp:check')],
-        ])
-      );
-    }
-
     await ctx.reply(
-      `✅ Регистрация успешна!\n\n` +
+      `✅ Аккаунт создан.\n\n` +
       `📋 Email: ${email}\n` +
-      `🌐 Инбаундов: ${inboundIds.length}\n` +
       `📊 Лимит: ${cfg.default_traffic_gb} ГБ — общий на все инбаунды\n` +
       `⏸ Ожидание активации администратором`,
       mainKeyboard(ctx, cfg)
@@ -179,34 +111,9 @@ async function recoverSubscription(ctx, user) {
       inboundIds,
       totalGB: Number(user.traffic_limit) || 0,
     });
-    const fresh = await db.resetUserClient({
+    await db.resetUserClient({
       tgId: user.tg_id, uuid: uuid || '', subId, trafficLimit: total,
     });
-
-    // Требование группы остаётся в силе, если оно не было подтверждено раньше
-    if (cfg.tg_group_id && !fresh.group_joined) {
-      let link = user.group_invite_link || '';
-      try {
-        link = (await getGroupLink(ctx, cfg)).link;
-      } catch (e) {
-        /* панель/группа недоступны — остаёмся с прежней ссылкой */
-      }
-      if (link) {
-        await db.setGroupJoined(user.tg_id, false, link);
-        const joined = await isGroupMember(ctx, user.tg_id);
-        if (joined) await db.setGroupJoined(user.tg_id, true, link);
-        return ctx.reply(
-          `♻️ Подписка восстановлена, но нужно подтверждение группы.\n\n` +
-          `📋 Email: ${user.email}\n` +
-          `⏸ Доступ активирует администратор\n\n` +
-          `👉 Нажмите «Вступить в группу», затем «Я вступил».`,
-          Markup.inlineKeyboard([
-            [Markup.button.url('👥 Вступить в группу', link)],
-            [Markup.button.callback(joined ? '✅ Вы в группе' : '✔️ Я вступил', 'grp:check')],
-          ])
-        );
-      }
-    }
 
     return ctx.reply(
       `♻️ Подписка восстановлена\n\n` +
@@ -246,26 +153,6 @@ function subscriptionGone(ctx) {
   );
 }
 
-/** Кнопка «Я вступил» — проверяем состав группы. */
-async function onGroupCheck(ctx) {
-  const tgId = ctx.from.id;
-  const user = await db.getUserByTgId(tgId);
-  if (!user) return ctx.answerCbQuery('Сначала нажмите /start');
-
-  const joined = await isGroupMember(ctx, tgId);
-  if (!joined) {
-    await db.setGroupJoined(tgId, false, user.group_invite_link || '');
-    return ctx.answerCbQuery('❌ Вас нет в группе — вступите и нажмите снова', { show_alert: true });
-  }
-
-  await db.setGroupJoined(tgId, true, user.group_invite_link || '');
-  await ctx.answerCbQuery('✅ Группа подтверждена');
-  return ctx.reply(
-    `✅ Группа подтверждена!\n\n⏸ Осталось дождаться активации подписки администратором.`,
-    mainKeyboard(ctx, getConfig())
-  );
-}
-
 async function sendSubLink(ctx, user) {
   const subUrl = await api.getSubscriptionUrl(user.sub_id);
   return ctx.reply(
@@ -298,16 +185,6 @@ async function cmdMySub(ctx) {
 
   if (!user) {
     return ctx.reply('❌ Вы не зарегистрированы. Нажмите /start для регистрации.');
-  }
-
-  // Подписка доступна только привязанным к группе
-  if (cfg.tg_group_id && !user.group_joined) {
-    const rows = [];
-    if (user.group_invite_link) {
-      rows.push([Markup.button.url('👥 Вступить в группу', user.group_invite_link)]);
-    }
-    rows.push([Markup.button.callback('✔️ Я вступил', 'grp:check')]);
-    return ctx.reply('⛔ Подписка доступна только после вступления в нашу Telegram-группу.', Markup.inlineKeyboard(rows));
   }
 
   // Панель — источник истины о статусе: клиента могли включить прямо в ней
@@ -371,9 +248,6 @@ async function onQrButton(ctx) {
   // должен получать QR так же, как /sub и /stats
   const user = await findUser(ctx);
   if (!user) return ctx.answerCbQuery('Сначала нажмите /start');
-  if (getConfig().tg_group_id && !user.group_joined) {
-    return ctx.answerCbQuery('⛔ Сначала вступите в группу', { show_alert: true });
-  }
   const fresh = await refreshStatus(user);
   if (fresh.panelMissing) {
     return ctx.answerCbQuery('⚠️ Подписка не найдена в панели — нажмите /start для восстановления', { show_alert: true });
@@ -432,9 +306,8 @@ async function cmdHelp(ctx) {
   await ctx.reply(
     `📖 Как пользоваться ботом\n\n` +
     `1️⃣ /start — регистрация, клиент создаётся во всех инбаундах\n` +
-    `2️⃣ Вступление в Telegram-группу — обязательно\n` +
-    `3️⃣ Активация администратором\n` +
-    `4️⃣ «Подписка» — ссылка для приложения, «QR-код» — картинка для телефона\n\n` +
+    `2️⃣ Активация администратором\n` +
+    `3️⃣ «Подписка» — ссылка для приложения, «QR-код» — картинка для телефона\n\n` +
     `📏 Лимит ${cfg.default_traffic_gb} ГБ расходуется суммарно по всем инбаундам.\n\n` +
     `Все действия — кнопками ниже.`,
     mainKeyboard(ctx, cfg)
@@ -476,10 +349,8 @@ module.exports = {
   sendQr,
   findUser,
   mainKeyboard,
-  onGroupCheck,
   onQrButton,
   onRecoverButton,
   recoverSubscription,
   onMenuCallback,
-  isGroupMember,
 };

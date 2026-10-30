@@ -39,7 +39,6 @@ async function main() {
   bot.command('setgroup', adminHandlers.cmdSetGroup);
 
   // Inline-кнопки
-  bot.action(/^grp:check$/, userHandlers.onGroupCheck);
   bot.action(/^sub:qr$/, userHandlers.onQrButton);
   bot.action(/^sub:recover$/, userHandlers.onRecoverButton);
   bot.action(/^menu:.+$/, userHandlers.onMenuCallback);
