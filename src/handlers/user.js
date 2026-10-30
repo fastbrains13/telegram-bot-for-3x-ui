@@ -79,7 +79,7 @@ async function cmdStart(ctx) {
     await ctx.reply(
       `✅ Аккаунт создан.\n\n` +
       `📋 Email: ${email}\n` +
-      `📊 Лимит: ${cfg.default_traffic_gb} ГБ — общий на все инбаунды\n` +
+      `📊 Лимит: ${cfg.default_traffic_gb === 0 ? '♾ Без ограничений' : cfg.default_traffic_gb + ' ГБ — общий на все инбаунды'}\n` +
       `⏸ Ожидание активации администратором`,
       mainKeyboard(ctx, cfg)
     );
@@ -120,7 +120,7 @@ async function recoverSubscription(ctx, user) {
       `Клиент был удалён из панели — мы создали его заново.\n` +
       `📋 Email: ${user.email}\n` +
       `🌐 Инбаундов: ${inboundIds.length}\n` +
-      `📊 Лимит: ${(total / GiB).toFixed(0)} ГБ — общий на все инбаунды\n` +
+      `📊 Лимит: ${total === 0 ? '♾ Без ограничений' : (total / GiB).toFixed(0) + ' ГБ'} — общий на все инбаунды\n` +
       `⏸ Доступ снова активирует администратор`,
       mainKeyboard(ctx, cfg)
     );
@@ -268,20 +268,21 @@ async function sendStats(ctx, user) {
 
     const used = (traffic.up || 0) + (traffic.down || 0);
     const limit = user.traffic_limit || traffic.total || 0;
-    const remaining = Math.max(0, limit - used);
-    const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+    const unlimited = limit === 0;
+    const remaining = unlimited ? 0 : Math.max(0, limit - used);
+    const pct = !unlimited && limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
     const filled = Math.round(pct / 10);
-    const bar = '▓'.repeat(filled) + '░'.repeat(10 - filled);
+    const bar = unlimited ? '' : '▓'.repeat(filled) + '░'.repeat(10 - filled) + '\n';
 
     await ctx.reply(
       `📊 Статистика подписки\n\n` +
       `📡 Статус: ${traffic.enable ? '🟢 Активен' : '🔴 Неактивен'}\n` +
       `⬇️ Скачано: ${(traffic.down / GiB).toFixed(2)} ГБ\n` +
       `⬆️ Отдано: ${(traffic.up / GiB).toFixed(2)} ГБ\n` +
-      `🔄 Израсходовано: ${(used / GiB).toFixed(2)} ГБ (${pct}%)\n` +
-      `${bar}\n` +
-      `📏 Лимит: ${(limit / GiB).toFixed(0)} ГБ — общий на все инбаунды\n` +
-      `✅ Остаток: ${(remaining / GiB).toFixed(2)} ГБ`,
+      `🔄 Израсходовано: ${(used / GiB).toFixed(2)} ГБ${unlimited ? '' : ' (' + pct + '%)'}\n` +
+      (unlimited ? '' : bar) +
+      `📏 Лимит: ${unlimited ? '♾ Без ограничений' : (limit / GiB).toFixed(0) + ' ГБ'} — общий на все инбаунды\n` +
+      (unlimited ? '' : `✅ Остаток: ${(remaining / GiB).toFixed(2)} ГБ`),
       mainKeyboard(ctx, getConfig())
     );
   } catch (e) {
@@ -308,7 +309,7 @@ async function cmdHelp(ctx) {
     `1️⃣ /start — регистрация, клиент создаётся во всех инбаундах\n` +
     `2️⃣ Активация администратором\n` +
     `3️⃣ «Подписка» — ссылка для приложения, «QR-код» — картинка для телефона\n\n` +
-    `📏 Лимит ${cfg.default_traffic_gb} ГБ расходуется суммарно по всем инбаундам.\n\n` +
+    `📏 Лимит ${cfg.default_traffic_gb === 0 ? '♾ без ограничений' : cfg.default_traffic_gb + ' ГБ'} расходуется суммарно по всем инбаундам.\n\n` +
     `Все действия — кнопками ниже.`,
     mainKeyboard(ctx, cfg)
   );

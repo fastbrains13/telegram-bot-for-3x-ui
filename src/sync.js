@@ -10,6 +10,7 @@ let timer = null;
 let running = false;
 
 function fmtGB(bytes) {
+  if (!bytes || bytes === 0) return '♾ без ограничений';
   return ((bytes || 0) / GiB).toFixed(0) + ' ГБ';
 }
 

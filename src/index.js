@@ -37,6 +37,7 @@ async function main() {
   bot.command('broadcast', adminHandlers.cmdBroadcast);
   bot.command('delete', adminHandlers.cmdDelete);
   bot.command('setgroup', adminHandlers.cmdSetGroup);
+  bot.command('setlimit', adminHandlers.cmdSetLimit);
 
   // Inline-кнопки
   bot.action(/^sub:qr$/, userHandlers.onQrButton);

@@ -96,9 +96,12 @@ async function apiRequest(path, method = 'GET', body = null, allowRetry = true) 
 
 // Поле totalGB в API панели хранит байты, а не гигабайты
 // (в исходниках Total = client.TotalGB пишется прямо в client_traffics.total).
+// 0 ГБ = без ограничений — панель понимает totalGB = 0 именно так.
 function trafficBytes() {
-  const gb = Number(getConfig().default_traffic_gb) || 100;
-  return Math.round(gb * GiB);
+  const raw = getConfig().default_traffic_gb;
+  const gb = Number(raw);
+  if (raw !== undefined && raw !== null && raw !== '' && gb === 0) return 0;
+  return Math.round((gb > 0 ? gb : 100) * GiB);
 }
 
 function getApiMode() {

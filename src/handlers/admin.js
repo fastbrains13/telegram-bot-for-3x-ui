@@ -64,6 +64,8 @@ async function cmdDashboard(ctx) {
     const cfg = getConfig();
     const groupName = String(cfg.panel_client_group || '').trim();
     const groupLine = `\n🏷 Группа для новых клиентов: ${groupName ? `<b>${esc(groupName)}</b>` : '(без группы)'}`;
+    const limitGB = Number(cfg.default_traffic_gb) || 0;
+    const limitLine = `\n📏 Лимит по умолчанию: ${limitGB === 0 ? '♾ Без ограничений' : limitGB + ' ГБ'}`;
 
     await ctx.reply(
       `📊 ПАНЕЛЬ АДМИНИСТРАТОРА\n\n` +
@@ -77,7 +79,7 @@ async function cmdDashboard(ctx) {
       `💾 CPU: ${status && typeof status.cpu === 'number' ? status.cpu.toFixed(1) + '%' : 'N/A'}\n` +
       `🧠 RAM: ${memTot ? fmtGB(memCur) + ' из ' + fmtGB(memTot) : 'N/A'}\n` +
       `📦 Панель: ${status && status.panelVersion ? status.panelVersion : 'N/A'}\n` +
-      `🔌 API: ${mode} — ${quotaNote}${groupLine}\n\n` +
+      `🔌 API: ${mode} — ${quotaNote}${groupLine}${limitLine}\n\n` +
       `👑 КОМАНДЫ АДМИНИСТРАТОРА\n` +
       `🔗 Ниже — кнопки для быстрого доступа к командам.`,
       {
@@ -94,8 +96,9 @@ async function cmdDashboard(ctx) {
           ],
           [Markup.button.callback('🗑 /delete', 'adm:delete')],
           [Markup.button.callback('📢 /broadcast', 'adm:broadcast')],
+          [Markup.button.callback('📏 Лимит', 'adm:limit')],
           [Markup.button.callback('🔄 Обновить', 'adm:dashboard')],
-        ]).reply_markup,
+        ]),
       }
     );
   } catch (e) {
@@ -215,8 +218,109 @@ async function buildGroupScreen(ctx) {
         Markup.button.callback('🔄 Обновить', 'adm:group'),
         Markup.button.callback('👑 Дашборд', 'adm:dashboard'),
       ],
-    ]).reply_markup,
+    ]),
   });
+}
+
+/**
+ * /setlimit <ГБ> — задать лимит трафика по умолчанию для новых клиентов.
+ * 0 = без ограничений. Без аргумента — экран выбора.
+ */
+async function cmdSetLimit(ctx) {
+  if (!isAdmin(ctx)) return ctx.reply('⛔ Доступ запрещён.');
+
+  const text = (ctx.message.text || '').trim();
+  const arg = text.replace(/^\/setlimit\s*/, '').trim();
+
+  if (!arg) return buildLimitScreen(ctx);
+
+  const gb = Number(arg);
+  if (!Number.isFinite(gb) || gb < 0) {
+    return ctx.reply('❌ Укажите число ГБ ≥ 0 или 0 для безлимитного трафика.');
+  }
+
+  const cfg = getConfig();
+  const prev = cfg.default_traffic_gb;
+  cfg.default_traffic_gb = gb;
+  saveConfig(cfg);
+
+  return ctx.reply(
+    `📏 Лимит изменён\n\n` +
+    `Было: ${Number(prev) === 0 ? '♾ Без ограничений' : prev + ' ГБ'}\n` +
+    `Стало: ${gb === 0 ? '♾ Без ограничений' : gb + ' ГБ'}\n\n` +
+    `⚠️ Изменение действует на НОВЫХ клиентов; существующих не трогает.`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📏 Изменить лимит', 'adm:limit')],
+        [Markup.button.callback('👑 Дашборд', 'adm:dashboard')],
+      ]),
+    }
+  );
+}
+
+/** Экран настройки лимита трафика по умолчанию. */
+async function buildLimitScreen(ctx) {
+  const cfg = getConfig();
+  const cur = Number(cfg.default_traffic_gb) || 0;
+  const bot = (await ctx.telegram.getMe()).username;
+
+  const curText = cur === 0 ? '♾ Без ограничений' : cur + ' ГБ';
+
+  const rows = [];
+  // Быстрые кнопки-команды
+  const quick = [0, 10, 50, 100, 500];
+  for (const n of quick) {
+    const label = n === 0 ? '♾ Безлимит' : n + ' ГБ';
+    rows.push(Markup.button.callback(label, `adm:setlimit:${n}`));
+  }
+
+  return ctx.reply(
+    `📏 ЛИМИТ ТРАФИКА ПО УМОЛЧАНИЮ\n\n` +
+    `Сейчас: <b>${curText}</b>\n\n` +
+    `0 = без ограничений (∞), остальные значения — ГБ на все инбаунды.\n` +
+    `Действует на НОВЫХ клиентов при регистрации.\n\n` +
+    `Можно задать и командой: <code>/setlimit 50</code> или <code>/setlimit 0</code>`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [
+          ...rows,
+        ],
+        [
+          Markup.button.callback('👥 Пользователи', 'adm:users:0'),
+          Markup.button.callback('👑 Дашборд', 'adm:dashboard'),
+        ],
+      ]),
+    }
+  );
+}
+
+/** Быстрое изменение лимита по callback */
+async function quickSetLimit(ctx, gb) {
+  const cfg = getConfig();
+  const prev = cfg.default_traffic_gb;
+  cfg.default_traffic_gb = gb;
+  saveConfig(cfg);
+
+  const curText = gb === 0 ? '♾ Без ограничений' : gb + ' ГБ';
+  const prevText = Number(prev) === 0 ? '♾ Без ограничений' : prev + ' ГБ';
+
+  await ctx.answerCbQuery('✅ Лимит обновлён');
+  return ctx.reply(
+    `📏 Лимит изменён\n\n` +
+    `Было: ${prevText}\n` +
+    `Стало: ${curText}\n\n` +
+    `⚠️ Изменение действует на НОВЫХ клиентов; существующих не трогает.`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📏 Изменить лимит', 'adm:limit')],
+        [Markup.button.callback('👥 Пользователи', 'adm:users:0')],
+        [Markup.button.callback('👑 Дашборд', 'adm:dashboard')],
+      ]),
+    }
+  );
 }
 
 /**
@@ -230,8 +334,6 @@ async function cmdSetGroup(ctx) {
   const arg = text.replace(/^\/setgroup\s*/, '').trim();
 
   if (!arg) return buildGroupScreen(ctx);
-
-  // "-" — явный выбор «без группы» (пустой аргумент открывает экран выбора)
   const name = /^[-—]$/.test(arg) ? '' : arg;
 
   // Имя группы: без переносов, вразумительной длины
@@ -270,7 +372,7 @@ async function cmdSetGroup(ctx) {
           Markup.button.callback('🏷 Все группы', 'adm:group'),
           Markup.button.callback('👑 Дашборд', 'adm:dashboard'),
         ],
-      ]).reply_markup,
+      ]),
     }
   );
 }
@@ -342,6 +444,16 @@ async function onAdminCallback(ctx) {
   if (data === 'adm:broadcast') {
     await ctx.answerCbQuery();
     return ctx.reply('Введите текст рассылки:\nПример: <code>/broadcast Привет! Сервис обновлён.</code>', { parse_mode: 'HTML' });
+  }
+
+  if (data === 'adm:limit') {
+    await ctx.answerCbQuery();
+    return buildLimitScreen(ctx);
+  }
+
+  const limitMatch = data.match(/^adm:setlimit:(\d+)$/);
+  if (limitMatch) {
+    return quickSetLimit(ctx, parseInt(limitMatch[1], 10));
   }
 
   // adm:users:N — пагинация
@@ -477,5 +589,6 @@ module.exports = {
   cmdBroadcast,
   cmdDelete,
   cmdSetGroup,
+  cmdSetLimit,
   onAdminCallback,
 };

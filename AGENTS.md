@@ -17,7 +17,7 @@ src/api3xui.js          — клиент API 3x-ui: детект режима, C
 src/sync.js             — периодический опрос панели: снимок клиентов, статусы, импорт ручных, уведомления
 src/setupGroups.js      — шаг установщика: показать клиентов/группы панели, выбрать группу для новых
 src/handlers/user.js    — /start /my_sub /sub /stats /help + callback'и grp:/sub:/menu:
-src/handlers/admin.js   — /dashboard /users /enable /disable /broadcast /delete /setgroup + callback'и adm:
+src/handlers/admin.js   — /dashboard /users /enable /disable /broadcast /delete /setgroup /setlimit + callback'и adm:
 installer.sh            — интерактивная установка; СОДЕРЖИТ ВСТРОЕННЫЕ КОПИИ src/*.js (см. ниже)
 data/                   — config.json и bot.db (в .gitignore, НИКОГДА не коммитить)
 ```
@@ -74,6 +74,15 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
   конфиге — осознанный выбор, а не «не задано» (в `setupGroups.js` — функция `currentGroup()`).
 - Меняется только группа НОВЫХ клиентов; существующих бот не переносит (экран и `/setgroup`
   предупреждают).
+
+### 4a. Лимит трафика: настройка и /setlimit
+- `default_traffic_gb` в конфиге — лимит по умолчанию для новых клиентов (в ГБ, не байтах).
+- **`0` = без ограничений**: панель получает `totalGB: 0`, `trafficBytes()` возвращает `0`,
+  текст везде показывает «♾ Без ограничений», `/stats` скрывает прогресс-бар и остаток.
+- `/setlimit` (admin): без аргумента — экран с кнопками (♾ Безлимит, 10/50/100/500 ГБ) и
+  подсказкой `/setlimit <число>`; с аргументом — сразу запись в конфиг через `saveConfig()`
+  (действует на новые регистрации без рестарта). Callback `adm:setlimit:<N>` — быстрая смена.
+- Dashboard показывает `📏 Лимит по умолчанию: <число|♾ Без ограничений>` и кнопку `📏 Лимит`.
 
 ### 5. Панель — источник истины о статусе (src/sync.js)
 `syncOnce(telegram)` вызывается при старте бота и каждые `sync_interval_sec`:
@@ -141,7 +150,7 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
   уведомлении о новом клиенте. Аргумент `/enable|/disable|/delete` — `tg_id` **или** email:
   разрешается через `resolveEmail()` (users → getClientByTgId → как есть).
 - **`/dashboard`** — команды администратора выводятся inline-кнопками (`adm:enable`, `adm:disable`,
-  `adm:delete`, `adm:broadcast`), каждая открывает подсказку по аргументу.
+  `adm:delete`, `adm:broadcast`, `adm:limit`), каждая открывает подсказку по аргументу.
 - Текст `/help` НЕ должен содержать админ-команд; они выводятся в `/dashboard`.
 
 ## Стиль кода
@@ -170,7 +179,7 @@ data/                   — config.json и bot.db (в .gitignore, НИКОГДА
    syncOnce (уведомление админа + отсутствие дублей) → панельный toggle → статус в боте → adm:tgl →
    /broadcast → /delete. Плюс: `__panel_del` → «не найдена в панели» в /sub, /stats, QR → /delete
    чистит базу; `/setgroup` (экран/смена/`-`/длинное имя/не-админ) → новая регистрация в выбранную
-    группу без рестарта; `node src/setupGroups.js --print|--set` и интерактив через `SETUP_INTERACTIVE=1`.
+    группу без рестарта; `/setlimit` (экран/смена/`0`/не-админ) → новая регистрация с безлимитом; `node src/setupGroups.js --print|--set` и интерактив через `SETUP_INTERACTIVE=1`.
     Отдельно проверять: `/start` после `__panel_del` пересоздаёт клиента с ТЕМ ЖЕ `sub_id` и
     `enable:false` (ссылка не меняется), кнопка `sub:recover`, `/start` живого клиента не пересоздаёт;
     `/users` на 25+ клиентах — 2 страницы по 15 и 10, навигация «◀️ Назад / Вперёд ▶️».
